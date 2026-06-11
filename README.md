@@ -13,6 +13,9 @@
 A tiny native macOS menu-bar app that shows your **Claude subscription usage** —
 the same numbers as Claude Code's "Plan usage limits" panel — right in your menu bar.
 
+> **Why "Cookie Monster"?** It started life as *Token Monster* — it watches Claude
+> gobble through your tokens. "Cookie Monster" just has the better appetite. 🍪
+
 ```
 🍪 27%      ← your current 5-hour session usage, color-coded
 ```
