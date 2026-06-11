@@ -1,0 +1,29 @@
+name: Bug report
+description: Report a problem with Cookie Monster
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version
+      placeholder: "e.g. 14.5"
+    validations:
+      required: true
+  - type: input
+    id: app-version
+    attributes:
+      label: Cookie Monster version
+      placeholder: "e.g. 0.2.0"
+  - type: textarea
+    id: log
+    attributes:
+      label: Diagnostic log (optional)
+      description: Relevant lines from ~/.cookie-monster/cookie-monster.log (no secrets are logged).
+      render: shell
