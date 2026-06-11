@@ -12,12 +12,19 @@ jobs:
     name: Build & publish
     runs-on: macos-14
     env:
-      # 'true' only when the signing secret is configured.
+      # 'true' only when signing secrets are configured (see NOTARIZATION.md).
       HAS_SIGNING: ${{ secrets.MACOS_CERT_P12_BASE64 != '' }}
       SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
       NOTARY_PROFILE: CookieMonster
     steps:
+      - name: Skip when no signing secrets
+        if: env.HAS_SIGNING != 'true'
+        run: |
+          echo "::warning::No signing secrets configured — skipping the release build."
+          echo "Add the secrets listed in NOTARIZATION.md to enable notarized releases."
+
       - uses: actions/checkout@v4
+        if: env.HAS_SIGNING == 'true'
 
       - name: Import Developer ID certificate
         if: env.HAS_SIGNING == 'true'
@@ -48,11 +55,8 @@ jobs:
         if: env.HAS_SIGNING == 'true'
         run: ./release.sh
 
-      - name: Build unsigned (no signing secrets configured)
-        if: env.HAS_SIGNING != 'true'
-        run: ./package.sh
-
       - name: Publish release
+        if: env.HAS_SIGNING == 'true'
         uses: softprops/action-gh-release@v2
         with:
           files: |

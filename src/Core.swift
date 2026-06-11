@@ -11,7 +11,7 @@ let kLoginPlistLabel = "com.cookiemonster.usage"
 let kPollInterval: TimeInterval = 60
 let kLogDir = (NSHomeDirectory() as NSString).appendingPathComponent(".cookie-monster")
 let kLogFile = (kLogDir as NSString).appendingPathComponent("cookie-monster.log")
-let kVersion = "0.2.0"
+let kVersion = "0.2.1"
 
 // MARK: - Logging (no secrets ever pass through here)
 
