@@ -4,7 +4,7 @@ Ship Cookie Monster **signed + notarized** so users never see the Gatekeeper
 "Apple could not verify…" warning. This requires the **paid Apple Developer
 Program** and a **Developer ID Application** certificate.
 
-Your Team ID: **`Q737S2247S`**.
+Your Team ID: **`29T68WB833`**.
 
 ## One-time setup
 
@@ -16,7 +16,7 @@ It installs into your login keychain. Verify:
 
 ```bash
 security find-identity -v -p codesigning | grep "Developer ID Application"
-# → "Developer ID Application: David Pflugpeil (Q737S2247S)"
+# → "Developer ID Application: David Pflugpeil (29T68WB833)"
 ```
 (Or create it at <https://developer.apple.com/account/resources/certificates>.)
 
@@ -28,13 +28,13 @@ At <https://appleid.apple.com> → **Sign-In & Security → App-Specific Passwor
 ```bash
 xcrun notarytool store-credentials "CookieMonster" \
   --apple-id "you@example.com" \
-  --team-id  "Q737S2247S" \
+  --team-id  "29T68WB833" \
   --password "xxxx-xxxx-xxxx-xxxx"
 ```
 
 ## Build a notarized release locally
 ```bash
-export SIGN_IDENTITY="Developer ID Application: David Pflugpeil (Q737S2247S)"
+export SIGN_IDENTITY="Developer ID Application: David Pflugpeil (29T68WB833)"
 export NOTARY_PROFILE="CookieMonster"
 ./release.sh
 ```
@@ -51,9 +51,9 @@ Actions → New repository secret**):
 |--------|-------|
 | `MACOS_CERT_P12_BASE64` | base64 of your exported Developer ID cert (`.p12`) |
 | `MACOS_CERT_PASSWORD`   | the password you set when exporting the `.p12` |
-| `MACOS_SIGN_IDENTITY`   | `Developer ID Application: David Pflugpeil (Q737S2247S)` |
+| `MACOS_SIGN_IDENTITY`   | `Developer ID Application: David Pflugpeil (29T68WB833)` |
 | `APPLE_ID`              | your Apple ID email |
-| `APPLE_TEAM_ID`         | `Q737S2247S` |
+| `APPLE_TEAM_ID`         | `29T68WB833` |
 | `APPLE_APP_PASSWORD`    | the app-specific password |
 
 Export the `.p12` from **Keychain Access**: find *Developer ID Application…* under

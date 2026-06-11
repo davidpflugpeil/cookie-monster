@@ -28,10 +28,12 @@ xcrun stapler staple "$APP"
 rm -f dist/_notarize.zip
 
 echo "› Packaging signed .dmg + .zip…"
+rm -f dist/Cookie-Monster-*.dmg dist/Cookie-Monster-*.zip   # don't notarize stale builds
 SKIP_BUILD=1 ./package.sh
 
-echo "› Notarizing + stapling the .dmg…"
+echo "› Signing + notarizing + stapling the .dmg…"
 DMG="$(ls dist/Cookie-Monster-*.dmg | head -1)"
+codesign --force --timestamp --sign "$SIGN_IDENTITY" "$DMG"
 xcrun notarytool submit "$DMG" --keychain-profile "$NOTARY_PROFILE" --wait
 xcrun stapler staple "$DMG"
 

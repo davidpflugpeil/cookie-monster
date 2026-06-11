@@ -13,6 +13,8 @@ All notable changes to Cookie Monster are documented here. The format is based o
 - **Pin to Menu Bar** setting — show **Session**, **Week**, or **Week (model)** in the bar.
 - **Update Every** setting — configurable poll interval (30s / 1 / 2 / 5 / 15 min).
 - App icon for Finder, the DMG, and the About box.
+- Release builds are now **signed and notarized** (Apple Developer ID) — they open
+  with a normal double-click, no Gatekeeper warning.
 
 ### Fixed
 - The "Updated …" counter and the reset countdowns now refresh when the menu opens

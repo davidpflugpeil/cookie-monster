@@ -40,12 +40,8 @@ Quit Cookie Monster      ⌘Q
 1. Grab the latest **`Cookie-Monster-x.y.z.dmg`** from the
    [Releases page](https://github.com/davidpflugpeil/cookie-monster/releases).
 2. Open the `.dmg` and drag **Cookie Monster** into **Applications**.
-3. **First launch.** macOS will block it (Gatekeeper). On **macOS 15 Sequoia**,
-   the right-click→Open shortcut is gone — instead open **System Settings →
-   Privacy & Security**, scroll to **Security**, and click **Open Anyway** next to
-   *""Cookie Monster" was blocked…"*, then confirm. (On macOS 14 and earlier you
-   can right-click the app → **Open** → **Open**.) Terminal alternative:
-   `xattr -dr com.apple.quarantine "/Applications/Cookie Monster.app"`.
+3. **Double-click to open** — release builds are **signed & notarized by Apple**,
+   so there's no Gatekeeper warning.
 4. macOS will ask to allow keychain access — click **Always Allow**.
 5. Enable auto-start from the 🍪 menu → **Start at Login**.
 
