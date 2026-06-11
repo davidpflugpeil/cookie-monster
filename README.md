@@ -1,5 +1,7 @@
 # Cookie Monster 🍪
 
+<img src="assets/icon.png" width="104" align="right" alt="Cookie Monster app icon"/>
+
 A tiny native macOS menu-bar app that shows your **Claude subscription usage** —
 the same numbers as Claude Code's "Plan usage limits" panel — right in your menu bar.
 
@@ -62,6 +64,18 @@ It is **read-only on your credentials**: it never writes to the keychain, never
 refreshes or modifies your token, and never logs the token or the raw API
 response. A small diagnostic log (status codes + percentages only) is kept at
 `~/.cookie-monster/cookie-monster.log`.
+
+## Settings
+
+All three are in the 🍪 menu and persist across restarts:
+
+- **Pin to Menu Bar** — choose which window's percentage shows in the bar:
+  **Session** (default), **Week**, or **Week (model)**.
+- **Update Every** — how often it polls: 30 seconds, 1 / 2 / 5 / 15 minutes
+  (default 1 minute).
+- **Menu Bar Style** — **Default** (a monochrome gauge whose needle tracks your
+  usage, in the native menu-bar text color) or **Vibrant** (the 🍪 emoji with a
+  green/orange/red percentage).
 
 ## Uninstall
 
