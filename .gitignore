@@ -1,0 +1,9 @@
+# Build artifacts
+Cookie Monster.app/
+/cookie-monster
+*.zip
+*.tar.gz
+dist/
+
+# macOS
+.DS_Store
