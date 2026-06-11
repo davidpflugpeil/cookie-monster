@@ -3,9 +3,9 @@
 <img src="assets/icon.png" width="104" align="right" alt="Cookie Monster app icon"/>
 
 [![Build](https://img.shields.io/github/actions/workflow/status/davidpflugpeil/cookie-monster/ci.yml?branch=main&label=build)](https://github.com/davidpflugpeil/cookie-monster/actions/workflows/ci.yml)
-[![Latest release](https://img.shields.io/github/v/release/davidpflugpeil/cookie-monster?sort=semver)](https://github.com/davidpflugpeil/cookie-monster/releases/latest)
-[![Downloads](https://img.shields.io/github/downloads/davidpflugpeil/cookie-monster/total)](https://github.com/davidpflugpeil/cookie-monster/releases)
-[![License: MIT](https://img.shields.io/github/license/davidpflugpeil/cookie-monster)](LICENSE)
+[![Latest release](https://img.shields.io/github/v/release/davidpflugpeil/cookie-monster?sort=semver&cacheSeconds=3600)](https://github.com/davidpflugpeil/cookie-monster/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/davidpflugpeil/cookie-monster/total?cacheSeconds=3600)](https://github.com/davidpflugpeil/cookie-monster/releases)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 ![Platform](https://img.shields.io/badge/platform-macOS%2013%2B-blue)
 ![Swift](https://img.shields.io/badge/Swift-6-orange?logo=swift&logoColor=white)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen)](CONTRIBUTING.md)
