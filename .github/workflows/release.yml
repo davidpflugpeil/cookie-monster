@@ -11,10 +11,47 @@ jobs:
   release:
     name: Build & publish
     runs-on: macos-14
+    env:
+      # 'true' only when the signing secret is configured.
+      HAS_SIGNING: ${{ secrets.MACOS_CERT_P12_BASE64 != '' }}
+      SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+      NOTARY_PROFILE: CookieMonster
     steps:
       - uses: actions/checkout@v4
-      - name: Package .dmg + .zip
+
+      - name: Import Developer ID certificate
+        if: env.HAS_SIGNING == 'true'
+        env:
+          CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          KEYCHAIN=build.keychain
+          KEYCHAIN_PASSWORD="ci-$(uuidgen)"
+          echo "$CERT_P12_BASE64" | base64 --decode > /tmp/cert.p12
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import /tmp/cert.p12 -k "$KEYCHAIN" -P "$CERT_PASSWORD" -T /usr/bin/codesign
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          rm -f /tmp/cert.p12
+
+      - name: Store notarization credentials
+        if: env.HAS_SIGNING == 'true'
+        run: |
+          xcrun notarytool store-credentials "$NOTARY_PROFILE" \
+            --apple-id "${{ secrets.APPLE_ID }}" \
+            --team-id "${{ secrets.APPLE_TEAM_ID }}" \
+            --password "${{ secrets.APPLE_APP_PASSWORD }}"
+
+      - name: Build · sign · notarize · package
+        if: env.HAS_SIGNING == 'true'
+        run: ./release.sh
+
+      - name: Build unsigned (no signing secrets configured)
+        if: env.HAS_SIGNING != 'true'
         run: ./package.sh
+
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:

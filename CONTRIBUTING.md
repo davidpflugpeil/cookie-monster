@@ -27,8 +27,10 @@ dependencies (AppKit + Foundation only), so it's easy to get into.
 ## Making a release
 1. Bump the version in `build.sh` (Info.plist), `package.sh`, and `src/Core.swift` (`kVersion`).
 2. Update `CHANGELOG.md`.
-3. `git tag vX.Y.Z && git push origin vX.Y.Z` — the **Release** workflow builds the
-   `.dmg`/`.zip` and publishes a GitHub Release.
+3. `git tag vX.Y.Z && git push origin vX.Y.Z` — the **Release** workflow builds,
+   signs, notarizes, and publishes the `.dmg`/`.zip`. See
+   [NOTARIZATION.md](NOTARIZATION.md) for the required secrets (without them it
+   builds unsigned). For a local notarized build, run `./release.sh`.
 
 ## Style
 Match the surrounding code: small functions, no third-party dependencies, and keep

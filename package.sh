@@ -9,7 +9,8 @@ APP="Cookie Monster.app"
 DMG="dist/Cookie-Monster-${VERSION}.dmg"
 ZIP="dist/Cookie-Monster-${VERSION}.zip"
 
-./build.sh
+# release.sh sets SKIP_BUILD=1 so it can package an already-signed/stapled app.
+if [ "${SKIP_BUILD:-0}" != "1" ]; then ./build.sh; fi
 
 echo "› Packaging…"
 mkdir -p dist
