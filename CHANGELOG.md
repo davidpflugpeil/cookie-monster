@@ -4,6 +4,21 @@ All notable changes to Cookie Monster are documented here. The format is based o
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.3.0] — 2026-07-29
+
+### Added
+- Redesigned dropdown: custom-drawn rounded progress bars with bold, color-coded
+  percentages and cleaner spacing.
+- Your signed-in **Claude account email** shown under the plan header.
+
+### Changed
+- New app bundle identifier (`com.pflugpeil.cookiemonster`).
+
+### Fixed
+- Menu-bar icon reliably reappears after relaunch/login — clears macOS's stale
+  "removed" state on launch and forces the item visible.
+- The account email now updates on refresh (was fetched only once).
+
 ## [0.2.1] — 2026-06-11
 
 Maintenance release — **no app changes from 0.2.0.** Releases are now built

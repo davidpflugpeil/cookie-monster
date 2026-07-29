@@ -87,12 +87,13 @@ enum LoginItem {
 // MARK: - App delegate
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
-    let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+    var statusItem: NSStatusItem!   // created in applicationDidFinishLaunching (not earlier)
     let menu = NSMenu()
     var timer: Timer?
     var menuTimer: Timer?                    // ticks while the menu is open
     var liveRefreshers: [() -> Void] = []    // updates time-sensitive rows in place
     var state: FetchState = .loading
+    var accountEmail: String?                // signed-in Claude account email (from oauth/profile)
     /// A monochrome gauge drawn as a template image (so macOS tints it to the menu
     /// bar). The needle reflects `percent`, so it agrees with the number beside it.
     static func makeGaugeIcon(percent: Double) -> NSImage {
@@ -121,6 +122,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     ]
 
     func applicationDidFinishLaunching(_ note: Notification) {
+        clearPersistedStatusItemState()   // always reappear, even if dragged off before
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        statusItem.isVisible = true
         log("launch (CC version \(claudeCodeVersion()), pin=\(Prefs.pinned.rawValue), every=\(Int(Prefs.interval))s, style=\(Prefs.displayMode.rawValue))")
         statusItem.button?.title = "🍪 …"
         menu.delegate = self          // repopulate on open → fresh "ago"/countdowns
@@ -128,6 +132,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         renderButton()
         refresh()
         startTimer()
+    }
+
+    /// When you drag the item off the menu bar, macOS persists a per-item
+    /// "removed"/hidden/position state under keys prefixed "NSStatusItem …" in the app's
+    /// own preferences — which then hides it on every relaunch. Clearing that on launch
+    /// guarantees the icon always comes back.
+    func clearPersistedStatusItemState() {
+        let d = UserDefaults.standard
+        for key in d.dictionaryRepresentation().keys where key.hasPrefix("NSStatusItem") {
+            d.removeObject(forKey: key)
+        }
     }
 
     func startTimer() {
@@ -143,6 +158,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             state = .needsAuth
             DispatchQueue.main.async { self.render() }
             return
+        }
+        fetchAccountEmail(creds: creds) { [weak self] email in
+            guard let email = email else { return }   // keep the last good value on failure
+            DispatchQueue.main.async { self?.accountEmail = email; self?.render() }
         }
         fetchUsage(creds: creds) { [weak self] result in
             DispatchQueue.main.async { self?.state = result; self?.render() }
@@ -248,7 +267,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func populate(_ menu: NSMenu) {
         liveRefreshers.removeAll()
-        let mono = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
         let usage: Usage? = { if case .ok(let u) = state { return u } else { return nil } }()
 
         func header(_ s: String) {
@@ -258,31 +276,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 .font: NSFont.systemFont(ofSize: 12, weight: .bold),
                 .foregroundColor: NSColor.secondaryLabelColor,
             ])
-            menu.addItem(it)
-        }
-
-        func windowRow(_ name: String, _ win: UsageWindow?) {
-            let it = NSMenuItem(title: name, action: nil, keyEquivalent: "")
-            it.isEnabled = false
-            guard let win = win else {
-                it.attributedTitle = NSAttributedString(string: "\(name)  —", attributes: [.font: mono])
-                menu.addItem(it); return
-            }
-            let label = name.padding(toLength: 11, withPad: " ", startingAt: 0)
-            let make: () -> NSAttributedString = {
-                let line = String(format: "%@ %@ %3.0f%%   resets in %@",
-                                  label, bar(win.utilization), win.utilization, countdown(to: win.resetsAt))
-                let attr = NSMutableAttributedString(string: line, attributes: [
-                    .font: mono, .foregroundColor: NSColor.labelColor,
-                ])
-                if let r = line.range(of: bar(win.utilization)) {
-                    attr.addAttribute(.foregroundColor, value: severityColor(win.utilization),
-                                      range: NSRange(r, in: line))
-                }
-                return attr
-            }
-            it.attributedTitle = make()
-            liveRefreshers.append { it.attributedTitle = make() }
             menu.addItem(it)
         }
 
@@ -298,20 +291,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let it = NSMenuItem(title: msg, action: nil, keyEquivalent: "")
             it.isEnabled = false; menu.addItem(it)
         case .ok(let u):
-            header("Claude \(planDisplayName(u.plan))")
-            menu.addItem(.separator())
-            windowRow("Session", u.session)
-            windowRow("Week", u.weekAll)
+            var rows: [InfoCardView.Row] = []
+            if let w = u.session { rows.append(.init(name: "Session", pct: w.utilization, resets: w.resetsAt)) }
+            if let w = u.weekAll { rows.append(.init(name: "Week", pct: w.utilization, resets: w.resetsAt)) }
             if let m = u.weekModel {
-                windowRow("Week \(u.weekModelLabel ?? "")".trimmingCharacters(in: .whitespaces), m)
+                rows.append(.init(name: "Week \(u.weekModelLabel ?? "")".trimmingCharacters(in: .whitespaces),
+                                  pct: m.utilization, resets: m.resetsAt))
             }
-            menu.addItem(.separator())
-            let updated = NSMenuItem(title: "", action: nil, keyEquivalent: "")
-            updated.isEnabled = false
-            let renderUpdated = { updated.title = "Updated \(ago(u.fetchedAt))" }
-            renderUpdated()
-            liveRefreshers.append(renderUpdated)
-            menu.addItem(updated)
+            let card = InfoCardView(plan: planDisplayName(u.plan), email: accountEmail, rows: rows, fetchedAt: u.fetchedAt)
+            let cardItem = NSMenuItem()
+            cardItem.isEnabled = false
+            cardItem.view = card
+            liveRefreshers.append { [weak card] in card?.refresh() }
+            menu.addItem(cardItem)
         }
 
         menu.addItem(.separator())
@@ -405,6 +397,74 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         render()
     }
     @objc func quit() { NSApp.terminate(nil) }
+}
+
+// MARK: - Info card (custom-drawn dropdown header: plan, email, usage bars, updated)
+
+final class InfoCardView: NSView {
+    struct Row { let name: String; let pct: Double; let resets: Date? }
+    private let plan: String
+    private let email: String?
+    private let rows: [Row]
+    private let fetchedAt: Date
+
+    init(plan: String, email: String?, rows: [Row], fetchedAt: Date) {
+        self.plan = plan; self.email = email; self.rows = rows; self.fetchedAt = fetchedAt
+        super.init(frame: NSRect(x: 0, y: 0, width: 300, height: 10))
+        setFrameSize(NSSize(width: 300, height: layout(false)))   // exact fit to content
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    override var isFlipped: Bool { true }        // lay out top→down
+    func refresh() { needsDisplay = true }        // recompute countdowns / "Updated …" on redraw
+
+    private func t(_ s: String, _ f: NSFont, _ c: NSColor) -> NSAttributedString {
+        NSAttributedString(string: s, attributes: [.font: f, .foregroundColor: c])
+    }
+    private func left(_ s: NSAttributedString, _ x: CGFloat, _ y: CGFloat) { s.draw(at: NSPoint(x: x, y: y)) }
+    private func right(_ s: NSAttributedString, _ rx: CGFloat, _ y: CGFloat) { s.draw(at: NSPoint(x: rx - s.size().width, y: y)) }
+
+    /// Single source of truth for layout: with `paint` false it only advances `y`
+    /// (so the frame fits exactly); with `paint` true it draws.
+    @discardableResult
+    private func layout(_ paint: Bool) -> CGFloat {
+        let x: CGFloat = 16, w = bounds.width, cw = w - x * 2
+        var y: CGFloat = 13
+        if paint { left(t("Claude \(plan)", .systemFont(ofSize: 13, weight: .bold), .secondaryLabelColor), x, y) }
+        y += 18
+        if let email = email {
+            if paint { left(t(email, .systemFont(ofSize: 12, weight: .regular), .tertiaryLabelColor), x, y) }
+            y += 18
+        }
+        y += 10
+        if paint { NSColor.quaternaryLabelColor.setFill(); NSRect(x: x, y: y, width: cw, height: 1).fill() }
+        y += 13
+        for (i, r) in rows.enumerated() {
+            if paint {
+                left(t(r.name, .systemFont(ofSize: 13, weight: .medium), .labelColor), x, y)
+                right(t(String(format: "%.0f%%", r.pct), .monospacedDigitSystemFont(ofSize: 13, weight: .semibold), severityColor(r.pct)), w - x, y)
+            }
+            y += 25
+            if paint {
+                let bh: CGFloat = 8
+                NSColor.quaternaryLabelColor.setFill()
+                NSBezierPath(roundedRect: NSRect(x: x, y: y, width: cw, height: bh), xRadius: bh/2, yRadius: bh/2).fill()
+                let fw = max(bh, cw * CGFloat(min(100, max(0, r.pct)) / 100))
+                severityColor(r.pct).setFill()
+                NSBezierPath(roundedRect: NSRect(x: x, y: y, width: fw, height: bh), xRadius: bh/2, yRadius: bh/2).fill()
+            }
+            y += 17
+            if paint { right(t("resets in \(countdown(to: r.resets))", .systemFont(ofSize: 12, weight: .medium), .secondaryLabelColor), w - x, y) }
+            y += 16
+            if i < rows.count - 1 { y += 16 }
+        }
+        y += 12
+        if paint { NSColor.quaternaryLabelColor.setFill(); NSRect(x: x, y: y, width: cw, height: 1).fill() }
+        y += 13
+        if paint { left(t("Updated \(ago(fetchedAt))", .systemFont(ofSize: 12, weight: .regular), .secondaryLabelColor), x, y) }
+        y += 16 + 13
+        return y
+    }
+    override func draw(_ dirtyRect: NSRect) { layout(true) }
 }
 
 // MARK: - Entry

@@ -7,11 +7,11 @@ import Foundation
 
 let kUsageURL = URL(string: "https://api.anthropic.com/api/oauth/usage")!
 let kKeychainService = "Claude Code-credentials"
-let kLoginPlistLabel = "com.cookiemonster.usage"
+let kLoginPlistLabel = "com.pflugpeil.cookiemonster"
 let kPollInterval: TimeInterval = 60
 let kLogDir = (NSHomeDirectory() as NSString).appendingPathComponent(".cookie-monster")
 let kLogFile = (kLogDir as NSString).appendingPathComponent("cookie-monster.log")
-let kVersion = "0.2.1"
+let kVersion = "0.3.0"
 
 // MARK: - Logging (no secrets ever pass through here)
 
@@ -192,6 +192,24 @@ func fetchUsage(creds: Credentials, completion: @escaping (FetchState) -> Void) 
         let w = u.weekAll.map { String(format: "%.0f%%", $0.utilization) } ?? "—"
         log("ok session=\(s) week=\(w)")
         completion(.ok(u))
+    }.resume()
+}
+
+/// Fetches the signed-in account's email from the OAuth profile endpoint.
+func fetchAccountEmail(creds: Credentials, completion: @escaping (String?) -> Void) {
+    var req = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/account")!)
+    req.setValue("Bearer \(creds.accessToken)", forHTTPHeaderField: "Authorization")
+    req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
+    req.setValue("claude-code/\(claudeCodeVersion())", forHTTPHeaderField: "User-Agent")
+    req.setValue("application/json", forHTTPHeaderField: "Accept")
+    req.timeoutInterval = 20
+    URLSession.shared.dataTask(with: req) { data, resp, _ in
+        guard (resp as? HTTPURLResponse)?.statusCode == 200, let data = data,
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let email = root["email_address"] as? String, !email.isEmpty else {
+            completion(nil); return
+        }
+        completion(email)
     }.resume()
 }
 
