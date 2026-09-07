@@ -342,7 +342,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             disabled(menu, msg, bold: false)
         case .ok(let u):
             let rows = u.metrics.map {
-                InfoCardView.Row(id: $0.id, name: $0.name, pct: $0.pct, resets: $0.resets)
+                InfoCardView.Row(id: $0.id, name: $0.name, detail: $0.detail,
+                                 pct: $0.pct, resets: $0.resets)
             }
             // claudeEmail arrives on its own request, so prefer the freshest value.
             let email = (p == .claude ? claudeEmail : nil) ?? u.email
@@ -382,7 +383,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if shown > 0 { sub.addItem(.separator()) }
             disabled(sub, "\(u.provider.label) \(u.plan)", bold: true)
             for m in u.metrics {
-                let it = NSMenuItem(title: "\(m.name) — \(String(format: "%.0f%%", m.pct))",
+                let qualifier = m.detail.map { " \($0)" } ?? ""
+                let it = NSMenuItem(title: "\(m.name)\(qualifier) — \(String(format: "%.0f%%", m.pct))",
                                     action: #selector(setPinned(_:)), keyEquivalent: "")
                 it.target = self
                 it.representedObject = m.id
@@ -481,7 +483,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 // MARK: - Info card (custom-drawn dropdown section: plan, email, usage bars, updated)
 
 final class InfoCardView: NSView {
-    struct Row { let id: String; let name: String; let pct: Double; let resets: Date? }
+    struct Row { let id: String; let name: String; let detail: String?; let pct: Double; let resets: Date? }
 
     private let title: String
     private let email: String?
@@ -496,8 +498,8 @@ final class InfoCardView: NSView {
          pinnedID: String?, onPick: @escaping (String) -> Void) {
         self.title = title; self.email = email; self.rows = rows
         self.fetchedAt = fetchedAt; self.pinnedID = pinnedID; self.onPick = onPick
-        super.init(frame: NSRect(x: 0, y: 0, width: 300, height: 10))
-        setFrameSize(NSSize(width: 300, height: layout(false)))   // exact fit to content
+        super.init(frame: NSRect(x: 0, y: 0, width: 340, height: 10))
+        setFrameSize(NSSize(width: 340, height: layout(false)))   // exact fit to content
     }
     required init?(coder: NSCoder) { fatalError() }
     override var isFlipped: Bool { true }        // lay out top→down
@@ -518,14 +520,12 @@ final class InfoCardView: NSView {
     private func right(_ s: NSAttributedString, _ rx: CGFloat, _ y: CGFloat) { s.draw(at: NSPoint(x: rx - s.size().width, y: y)) }
 
     /// A small "PINNED" pill marking the row that's showing in the menu bar.
-    private func pill(_ x: CGFloat, _ y: CGFloat) -> CGFloat {
+    private func pill(_ x: CGFloat, _ y: CGFloat) {
         let s = t("PINNED", .systemFont(ofSize: 9, weight: .bold), .controlAccentColor)
-        let w = s.size().width + 12
-        let r = NSRect(x: x, y: y + 2, width: w, height: 14)
+        let r = NSRect(x: x, y: y, width: s.size().width + 12, height: 15)
         NSColor.controlAccentColor.withAlphaComponent(0.15).setFill()
-        NSBezierPath(roundedRect: r, xRadius: 7, yRadius: 7).fill()
-        s.draw(at: NSPoint(x: x + 6, y: y + 4))
-        return w
+        NSBezierPath(roundedRect: r, xRadius: 7.5, yRadius: 7.5).fill()
+        s.draw(at: NSPoint(x: x + 6, y: y + 3))
     }
 
     /// Single source of truth for layout: with `paint` false it only advances `y`
@@ -555,7 +555,10 @@ final class InfoCardView: NSView {
                 }
                 let name = t(r.name, .systemFont(ofSize: 13, weight: isPinned ? .semibold : .medium), .labelColor)
                 left(name, x, y)
-                if isPinned { _ = pill(x + name.size().width + 8, y) }
+                if let d = r.detail {
+                    left(t(d, .systemFont(ofSize: 11, weight: .regular), .tertiaryLabelColor),
+                         x + name.size().width + 7, y + 2)
+                }
                 right(t(String(format: "%.0f%%", r.pct), .monospacedDigitSystemFont(ofSize: 13, weight: .bold), .labelColor), w - x, y)
             }
             y += 25
@@ -568,7 +571,10 @@ final class InfoCardView: NSView {
                 NSBezierPath(roundedRect: NSRect(x: x, y: y, width: fw, height: bh), xRadius: bh/2, yRadius: bh/2).fill()
             }
             y += 17
-            if paint { right(t("resets in \(countdown(to: r.resets))", .systemFont(ofSize: 12, weight: .medium), .secondaryLabelColor), w - x, y) }
+            if paint {
+                if isPinned { pill(x, y - 1) }
+                right(t("resets in \(countdown(to: r.resets))", .systemFont(ofSize: 12, weight: .medium), .secondaryLabelColor), w - x, y)
+            }
             y += 16
             if i < rows.count - 1 { y += 16 }
         }

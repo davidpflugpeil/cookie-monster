@@ -37,8 +37,9 @@ Updated 12s ago
 Codex Pro
 you@example.com
 ────────────────────────────────────────────
-5h               ████░░░░░░  42%  resets in 1h 59m
-Weekly           █░░░░░░░░░  12%  resets in 5d 23h
+5h  GPT-5.3-Codex-Spark  ███░░░░░░░  34%  resets in 4h 9m
+Weekly                   █░░░░░░░░░   1%  resets in 6d 21h
+Weekly  GPT-5.3-Codex-Spark  █░░░░░░░  12%  resets in 6d 21h
 ────────────────────────────────────────────
 Updated 12s ago
 
@@ -106,7 +107,8 @@ All three are in the 🍪 menu and persist across restarts:
 
 - **Pin to Menu Bar** — choose which window's percentage shows in the bar. Every
   window from every signed-in subscription is listed, grouped by provider
-  (Claude **Session** / **Week** / **Week (model)**, Codex **5h** / **Weekly**).
+  (Claude **Session** / **Week** / **Week (model)**, Codex **5h** / **Weekly**
+  plus any per-model caps), shortest window first.
   You can also just **click a row in the dropdown** to pin it.
 - **Update Every** — how often it polls: 30 seconds, 1 / 2 / 5 / 15 minutes
   (default 1 minute).
@@ -136,7 +138,11 @@ credentials are left untouched.
 - Both usage endpoints are **undocumented** and may change without notice. If the
   numbers stop appearing, check the field names in [`src/Core.swift`](src/Core.swift)
   (`five_hour` / `seven_day` / `seven_day_opus` / `seven_day_sonnet` for Claude,
-  `rate_limit.primary_window` / `secondary_window` for Codex).
+  `rate_limit`, `additional_rate_limits` and `code_review_rate_limit` for Codex).
+- **Codex windows vary by plan.** On Pro, `rate_limit.secondary_window` is null
+  and the account-wide window is the *weekly* one — the 5-hour cap is reported
+  inside `additional_rate_limits`, per model. Cookie Monster reads all of them,
+  so what you see depends on what your plan actually meters.
 
 ## Repo layout
 

@@ -62,6 +62,7 @@ struct Metric {
     let id: String          // e.g. "claude.session", "codex.primary"
     let provider: Provider
     let name: String        // "Session", "Week", "5h", "Weekly"
+    let detail: String?     // qualifier, e.g. the model a per-model cap applies to
     let pct: Double         // 0…100
     let resets: Date?
 }
@@ -230,6 +231,12 @@ func parseCodexWindow(_ obj: Any?) -> (pct: Double, span: Double, resets: Date?)
     return (pct, span, resets)
 }
 
+/// Lowercases and dash-escapes a display name so it can be part of a stable metric id.
+func slug(_ s: String) -> String {
+    let mapped = s.unicodeScalars.map { CharacterSet.alphanumerics.contains($0) ? Character($0) : "-" }
+    return String(mapped).lowercased()
+}
+
 /// Names a rate-limit window by its length: 18000s → "5h", 604800s → "Weekly".
 func windowLabel(_ seconds: Double) -> String {
     let hours = Int((seconds / 3600).rounded())
@@ -272,7 +279,8 @@ func fetchClaudeUsage(creds: Credentials, email: String?, completion: @escaping 
         var metrics: [Metric] = []
         func add(_ id: String, _ name: String, _ w: (pct: Double, resets: Date?)?) {
             guard let w = w else { return }
-            metrics.append(Metric(id: id, provider: .claude, name: name, pct: w.pct, resets: w.resets))
+            metrics.append(Metric(id: id, provider: .claude, name: name, detail: nil,
+                                  pct: w.pct, resets: w.resets))
         }
         add("claude.session", "Session", parseWindow(root["five_hour"]))
         add("claude.week", "Week", parseWindow(root["seven_day"]))
@@ -339,19 +347,43 @@ func fetchCodexUsage(creds: CodexCredentials, completion: @escaping (FetchState)
             completion(.error("HTTP \(http.statusCode)")); return
         }
 
-        let limits = (root["rate_limit"] as? [String: Any]) ?? [:]
-        var metrics: [Metric] = []
-        var used = Set<String>()
-        func add(_ id: String, _ w: (pct: Double, span: Double, resets: Date?)?) {
+        var found: [(span: Double, order: Int, metric: Metric)] = []
+        func add(_ id: String, _ detail: String?, _ w: (pct: Double, span: Double, resets: Date?)?) {
             guard let w = w else { return }
-            // Two windows can be the same length only in odd cases; keep names unique.
-            var name = windowLabel(w.span)
-            if used.contains(name) { name += " (2)" }
-            used.insert(name)
-            metrics.append(Metric(id: id, provider: .codex, name: name, pct: w.pct, resets: w.resets))
+            found.append((w.span, found.count,
+                          Metric(id: id, provider: .codex, name: windowLabel(w.span),
+                                 detail: detail, pct: w.pct, resets: w.resets)))
         }
-        add("codex.primary", parseCodexWindow(limits["primary_window"]))
-        add("codex.secondary", parseCodexWindow(limits["secondary_window"]))
+
+        // The account-wide windows. On some plans (Pro) only `primary_window` is
+        // populated and it's the weekly one — the 5h cap lives in the per-model
+        // limits below, so parsing just this block would hide it entirely.
+        let limits = (root["rate_limit"] as? [String: Any]) ?? [:]
+        add("codex.primary", nil, parseCodexWindow(limits["primary_window"]))
+        add("codex.secondary", nil, parseCodexWindow(limits["secondary_window"]))
+
+        // Per-model caps, e.g. a 5h window on a specific Codex model.
+        for entry in (root["additional_rate_limits"] as? [[String: Any]]) ?? [] {
+            let name = (entry["limit_name"] as? String) ?? "Model"
+            // metered_feature is a stable key; fall back to a slug of the display name
+            // so a pinned row survives OpenAI reordering the array.
+            let key = (entry["metered_feature"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? slug(name)
+            let rl = (entry["rate_limit"] as? [String: Any]) ?? [:]
+            add("codex.\(key).primary", name, parseCodexWindow(rl["primary_window"]))
+            add("codex.\(key).secondary", name, parseCodexWindow(rl["secondary_window"]))
+        }
+
+        // Codex cloud code review has its own budget on some plans.
+        if let cr = root["code_review_rate_limit"] as? [String: Any] {
+            let rl = (cr["rate_limit"] as? [String: Any]) ?? cr
+            add("codex.review.primary", "Code review", parseCodexWindow(rl["primary_window"]))
+            add("codex.review.secondary", "Code review", parseCodexWindow(rl["secondary_window"]))
+        }
+
+        // Shortest window first — a 5h cap is the one you can actually act on today.
+        let metrics = found
+            .sorted { $0.span != $1.span ? $0.span < $1.span : $0.order < $1.order }
+            .map { $0.metric }
 
         log("codex ok " + metrics.map { "\($0.name)=\(Int($0.pct))%" }.joined(separator: " "))
         completion(.ok(ProviderUsage(provider: .codex,
