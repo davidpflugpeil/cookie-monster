@@ -1,21 +1,25 @@
-// Core.swift — shared logic for the Cookie Monster 🍪 menu-bar app and CLI.
-// Foundation-only (no AppKit) so it compiles into both frontends.
+// Core.swift — shared logic for the Cookie Monster 🍪 menu-bar app.
+// Foundation-only (no AppKit) so it stays easy to test and reuse.
 
 import Foundation
 
 // MARK: - Constants
 
 let kUsageURL = URL(string: "https://api.anthropic.com/api/oauth/usage")!
+let kAccountURL = URL(string: "https://api.anthropic.com/api/oauth/account")!
 let kKeychainService = "Claude Code-credentials"
+let kCodexUsageURL = URL(string: "https://chatgpt.com/backend-api/codex/usage")!
+let kCodexDir = (NSHomeDirectory() as NSString).appendingPathComponent(".codex")
+let kCodexAuthPath = (kCodexDir as NSString).appendingPathComponent("auth.json")
 let kLoginPlistLabel = "com.pflugpeil.cookiemonster"
 let kPollInterval: TimeInterval = 60
 let kLogDir = (NSHomeDirectory() as NSString).appendingPathComponent(".cookie-monster")
 let kLogFile = (kLogDir as NSString).appendingPathComponent("cookie-monster.log")
-let kVersion = "0.3.0"
+let kVersion = "0.4.0"
 
 // MARK: - Logging (no secrets ever pass through here)
 
-/// Frontends install their own sink. Default is a no-op (used by the CLI).
+/// Frontends install their own sink. Default is a no-op.
 var logHandler: (String) -> Void = { _ in }
 func log(_ msg: String) { logHandler(msg) }
 
@@ -34,26 +38,47 @@ func fileLog(_ msg: String) {
     }
 }
 
-// MARK: - Models
+// MARK: - Providers
 
-struct UsageWindow {
-    var utilization: Double   // 0...100, percent used
-    var resetsAt: Date?
+enum Provider: String, CaseIterable {
+    case claude, codex
+    var label: String { self == .claude ? "Claude" : "Codex" }
+    /// Where "Open … Usage" sends you.
+    var usageURL: URL {
+        self == .claude ? URL(string: "https://claude.ai/settings/usage")!
+                        : URL(string: "https://chatgpt.com/codex/settings/usage")!
+    }
+    /// Shown when the provider is installed but not signed in.
+    var signInHint: String {
+        self == .claude ? "Open Claude Code and sign in, then Refresh"
+                        : "Run `codex` and sign in with ChatGPT, then Refresh"
+    }
 }
 
-struct Usage {
-    var session: UsageWindow?    // five_hour
-    var weekAll: UsageWindow?    // seven_day
-    var weekModel: UsageWindow?  // seven_day_opus / seven_day_sonnet
-    var weekModelLabel: String?  // "Opus" / "Sonnet"
-    var plan: String?
-    var fetchedAt: Date
+// MARK: - Models
+
+/// One usage window, identified by a stable `id` so it can be pinned to the menu bar.
+struct Metric {
+    let id: String          // e.g. "claude.session", "codex.primary"
+    let provider: Provider
+    let name: String        // "Session", "Week", "5h", "Weekly"
+    let pct: Double         // 0…100
+    let resets: Date?
+}
+
+struct ProviderUsage {
+    let provider: Provider
+    let plan: String        // display name: "Max", "Pro", …
+    let email: String?
+    let metrics: [Metric]
+    let fetchedAt: Date
 }
 
 enum FetchState {
+    case notConfigured      // provider isn't installed at all — hide it entirely
     case loading
-    case ok(Usage)
-    case needsAuth          // no token, or 401/403
+    case ok(ProviderUsage)
+    case needsAuth          // installed but no token, or 401/403
     case error(String)
 }
 
@@ -66,6 +91,11 @@ struct Credentials {
     var accessToken: String
     var plan: String?
     var expiresAt: Date?
+}
+
+struct CodexCredentials {
+    var accessToken: String
+    var accountId: String
 }
 
 // MARK: - Claude Code version (for the User-Agent header)
@@ -82,6 +112,15 @@ func claudeCodeVersion() -> String {
     return "2.1.172"
 }
 
+/// Codex writes the version it last checked for into ~/.codex/version.json.
+func codexVersion() -> String {
+    let path = (kCodexDir as NSString).appendingPathComponent("version.json")
+    if let data = FileManager.default.contents(atPath: path),
+       let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+       let v = root["latest_version"] as? String, !v.isEmpty { return v }
+    return "0.50.0"
+}
+
 func versionLess(_ a: String, _ b: String) -> Bool {
     let pa = a.split(separator: ".").compactMap { Int($0) }
     let pb = b.split(separator: ".").compactMap { Int($0) }
@@ -93,7 +132,7 @@ func versionLess(_ a: String, _ b: String) -> Bool {
     return false
 }
 
-// MARK: - Keychain → access token
+// MARK: - Claude credentials (login keychain)
 
 /// Reads the raw credential blob from the login keychain via `/usr/bin/security`.
 /// May trigger a one-time macOS "allow access" prompt on first use.
@@ -134,7 +173,32 @@ func readCredentials() -> Credentials? {
     return nil
 }
 
-// MARK: - Usage fetch
+/// True when Claude Code is present on this Mac (so we know whether to show the section).
+func claudeInstalled() -> Bool {
+    let fm = FileManager.default
+    for p in [".claude", ".claude.json", ".local/share/claude"] {
+        if fm.fileExists(atPath: (NSHomeDirectory() as NSString).appendingPathComponent(p)) { return true }
+    }
+    return false
+}
+
+// MARK: - Codex credentials (~/.codex/auth.json)
+
+/// True when the Codex CLI has been set up on this Mac.
+func codexInstalled() -> Bool { FileManager.default.fileExists(atPath: kCodexDir) }
+
+/// Reads the ChatGPT OAuth token Codex stores on disk. Read-only: we never
+/// refresh or rewrite `auth.json`, so we can't disturb a running Codex session.
+func readCodexCredentials() -> CodexCredentials? {
+    guard let data = FileManager.default.contents(atPath: kCodexAuthPath),
+          let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let tokens = root["tokens"] as? [String: Any],
+          let token = tokens["access_token"] as? String, !token.isEmpty else { return nil }
+    return CodexCredentials(accessToken: token,
+                            accountId: (tokens["account_id"] as? String) ?? "")
+}
+
+// MARK: - Parsing helpers
 
 func parseDate(_ s: String?) -> Date? {
     guard let s = s else { return nil }
@@ -146,13 +210,41 @@ func parseDate(_ s: String?) -> Date? {
     return f2.date(from: s)
 }
 
-func parseWindow(_ obj: Any?) -> UsageWindow? {
+func parseWindow(_ obj: Any?) -> (pct: Double, resets: Date?)? {
     guard let d = obj as? [String: Any],
           let util = (d["utilization"] as? NSNumber)?.doubleValue else { return nil }
-    return UsageWindow(utilization: util, resetsAt: parseDate(d["resets_at"] as? String))
+    return (util, parseDate(d["resets_at"] as? String))
 }
 
-func fetchUsage(creds: Credentials, completion: @escaping (FetchState) -> Void) {
+/// Codex reports windows as `{used_percent, limit_window_seconds, reset_at, reset_after_seconds}`.
+func parseCodexWindow(_ obj: Any?) -> (pct: Double, span: Double, resets: Date?)? {
+    guard let d = obj as? [String: Any],
+          let pct = (d["used_percent"] as? NSNumber)?.doubleValue else { return nil }
+    let span = (d["limit_window_seconds"] as? NSNumber)?.doubleValue ?? 0
+    var resets: Date? = nil
+    if let at = (d["reset_at"] as? NSNumber)?.doubleValue, at > 0 {
+        resets = Date(timeIntervalSince1970: at)
+    } else if let after = (d["reset_after_seconds"] as? NSNumber)?.doubleValue {
+        resets = Date().addingTimeInterval(after)
+    }
+    return (pct, span, resets)
+}
+
+/// Names a rate-limit window by its length: 18000s → "5h", 604800s → "Weekly".
+func windowLabel(_ seconds: Double) -> String {
+    let hours = Int((seconds / 3600).rounded())
+    switch hours {
+    case ..<1:      return "Hourly"
+    case 24:        return "Daily"
+    case 168:       return "Weekly"
+    case 672...744: return "Monthly"
+    default:        return hours % 24 == 0 ? "\(hours / 24)d" : "\(hours)h"
+    }
+}
+
+// MARK: - Claude fetch
+
+func fetchClaudeUsage(creds: Credentials, email: String?, completion: @escaping (FetchState) -> Void) {
     var req = URLRequest(url: kUsageURL)
     req.httpMethod = "GET"
     req.setValue("Bearer \(creds.accessToken)", forHTTPHeaderField: "Authorization")
@@ -163,41 +255,45 @@ func fetchUsage(creds: Credentials, completion: @escaping (FetchState) -> Void) 
 
     URLSession.shared.dataTask(with: req) { data, resp, err in
         if let err = err {
-            log("fetch error: \(err.localizedDescription)")
+            log("claude fetch error: \(err.localizedDescription)")
             completion(.error(err.localizedDescription)); return
         }
-        guard let http = resp as? HTTPURLResponse else {
-            completion(.error("no response")); return
-        }
+        guard let http = resp as? HTTPURLResponse else { completion(.error("no response")); return }
         if http.statusCode == 401 || http.statusCode == 403 {
-            log("fetch http \(http.statusCode) → needs auth")
+            log("claude fetch http \(http.statusCode) → needs auth")
             completion(.needsAuth); return
         }
         guard http.statusCode == 200, let data = data,
               let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            log("fetch http \((resp as? HTTPURLResponse)?.statusCode ?? -1)")
-            completion(.error("HTTP \((resp as? HTTPURLResponse)?.statusCode ?? -1)")); return
+            log("claude fetch http \(http.statusCode)")
+            completion(.error("HTTP \(http.statusCode)")); return
         }
 
-        var u = Usage(session: nil, weekAll: nil, weekModel: nil,
-                      weekModelLabel: nil, plan: creds.plan, fetchedAt: Date())
-        u.session = parseWindow(root["five_hour"])
-        u.weekAll = parseWindow(root["seven_day"])
-        if let m = parseWindow(root["seven_day_opus"]) {
-            u.weekModel = m; u.weekModelLabel = "Opus"
-        } else if let m = parseWindow(root["seven_day_sonnet"]) {
-            u.weekModel = m; u.weekModelLabel = "Sonnet"
+        var metrics: [Metric] = []
+        func add(_ id: String, _ name: String, _ w: (pct: Double, resets: Date?)?) {
+            guard let w = w else { return }
+            metrics.append(Metric(id: id, provider: .claude, name: name, pct: w.pct, resets: w.resets))
         }
-        let s = u.session.map { String(format: "%.0f%%", $0.utilization) } ?? "—"
-        let w = u.weekAll.map { String(format: "%.0f%%", $0.utilization) } ?? "—"
-        log("ok session=\(s) week=\(w)")
-        completion(.ok(u))
+        add("claude.session", "Session", parseWindow(root["five_hour"]))
+        add("claude.week", "Week", parseWindow(root["seven_day"]))
+        if let m = parseWindow(root["seven_day_opus"]) {
+            add("claude.weekModel", "Week Opus", m)
+        } else if let m = parseWindow(root["seven_day_sonnet"]) {
+            add("claude.weekModel", "Week Sonnet", m)
+        }
+
+        log("claude ok " + metrics.map { "\($0.name)=\(Int($0.pct))%" }.joined(separator: " "))
+        completion(.ok(ProviderUsage(provider: .claude,
+                                     plan: planDisplayName(creds.plan),
+                                     email: email,
+                                     metrics: metrics,
+                                     fetchedAt: Date())))
     }.resume()
 }
 
-/// Fetches the signed-in account's email from the OAuth profile endpoint.
+/// Fetches the signed-in Claude account's email.
 func fetchAccountEmail(creds: Credentials, completion: @escaping (String?) -> Void) {
-    var req = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/account")!)
+    var req = URLRequest(url: kAccountURL)
     req.setValue("Bearer \(creds.accessToken)", forHTTPHeaderField: "Authorization")
     req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
     req.setValue("claude-code/\(claudeCodeVersion())", forHTTPHeaderField: "User-Agent")
@@ -213,21 +309,60 @@ func fetchAccountEmail(creds: Credentials, completion: @escaping (String?) -> Vo
     }.resume()
 }
 
-/// Blocking fetch for the CLI.
-func fetchUsageSync(creds: Credentials, timeout: TimeInterval = 25) -> FetchState {
-    let sem = DispatchSemaphore(value: 0)
-    var result: FetchState = .error("timed out")
-    fetchUsage(creds: creds) { result = $0; sem.signal() }
-    _ = sem.wait(timeout: .now() + timeout)
-    return result
+// MARK: - Codex fetch
+
+func fetchCodexUsage(creds: CodexCredentials, completion: @escaping (FetchState) -> Void) {
+    var req = URLRequest(url: kCodexUsageURL)
+    req.httpMethod = "GET"
+    req.setValue("Bearer \(creds.accessToken)", forHTTPHeaderField: "Authorization")
+    if !creds.accountId.isEmpty {
+        req.setValue(creds.accountId, forHTTPHeaderField: "chatgpt-account-id")
+    }
+    req.setValue("codex_cli_rs", forHTTPHeaderField: "originator")
+    req.setValue("codex_cli_rs/\(codexVersion())", forHTTPHeaderField: "User-Agent")
+    req.setValue("application/json", forHTTPHeaderField: "Accept")
+    req.timeoutInterval = 20
+
+    URLSession.shared.dataTask(with: req) { data, resp, err in
+        if let err = err {
+            log("codex fetch error: \(err.localizedDescription)")
+            completion(.error(err.localizedDescription)); return
+        }
+        guard let http = resp as? HTTPURLResponse else { completion(.error("no response")); return }
+        if http.statusCode == 401 || http.statusCode == 403 {
+            log("codex fetch http \(http.statusCode) → needs auth")
+            completion(.needsAuth); return
+        }
+        guard http.statusCode == 200, let data = data,
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            log("codex fetch http \(http.statusCode)")
+            completion(.error("HTTP \(http.statusCode)")); return
+        }
+
+        let limits = (root["rate_limit"] as? [String: Any]) ?? [:]
+        var metrics: [Metric] = []
+        var used = Set<String>()
+        func add(_ id: String, _ w: (pct: Double, span: Double, resets: Date?)?) {
+            guard let w = w else { return }
+            // Two windows can be the same length only in odd cases; keep names unique.
+            var name = windowLabel(w.span)
+            if used.contains(name) { name += " (2)" }
+            used.insert(name)
+            metrics.append(Metric(id: id, provider: .codex, name: name, pct: w.pct, resets: w.resets))
+        }
+        add("codex.primary", parseCodexWindow(limits["primary_window"]))
+        add("codex.secondary", parseCodexWindow(limits["secondary_window"]))
+
+        log("codex ok " + metrics.map { "\($0.name)=\(Int($0.pct))%" }.joined(separator: " "))
+        completion(.ok(ProviderUsage(provider: .codex,
+                                     plan: planDisplayName(root["plan_type"] as? String),
+                                     email: root["email"] as? String,
+                                     metrics: metrics,
+                                     fetchedAt: Date())))
+    }.resume()
 }
 
 // MARK: - Pure formatting helpers (no AppKit)
-
-func bar(_ pct: Double, width: Int = 10) -> String {
-    let filled = max(0, min(width, Int((pct / 100.0 * Double(width)).rounded())))
-    return String(repeating: "█", count: filled) + String(repeating: "░", count: width - filled)
-}
 
 func countdown(to date: Date?) -> String {
     guard let date = date else { return "—" }
@@ -250,7 +385,9 @@ func planDisplayName(_ raw: String?) -> String {
     let s = (raw ?? "").lowercased()
     if s.contains("max") { return "Max" }
     if s == "pro" { return "Pro" }
+    if s == "plus" { return "Plus" }
     if s == "team" { return "Team" }
+    if s == "business" || s == "enterprise" { return raw!.capitalized }
     if s.isEmpty { return "subscription" }
     return (raw ?? "").capitalized
 }

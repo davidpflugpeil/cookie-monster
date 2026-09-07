@@ -13,12 +13,8 @@ func severityColor(_ pct: Double) -> NSColor {
 
 // MARK: - Preferences (persisted in UserDefaults)
 
-enum PinnedMetric: String, CaseIterable {
-    case session, week, weekModel
-}
-
 enum DisplayMode: String, CaseIterable {
-    case mono       // black & white template cookie icon + default text color
+    case mono       // black & white template gauge + default text color
     case vibrant    // colorful 🍪 emoji + severity-colored percentage
     var label: String { self == .vibrant ? "Vibrant" : "Default" }
 }
@@ -26,9 +22,15 @@ enum DisplayMode: String, CaseIterable {
 enum Prefs {
     static let d = UserDefaults.standard
 
-    static var pinned: PinnedMetric {
-        get { PinnedMetric(rawValue: d.string(forKey: "pinnedMetric") ?? "") ?? .session }
-        set { d.set(newValue.rawValue, forKey: "pinnedMetric") }
+    /// The `Metric.id` shown in the menu bar, e.g. "claude.session" or "codex.primary".
+    static var pinnedID: String {
+        get {
+            if let id = d.string(forKey: "pinnedMetricID"), !id.isEmpty { return id }
+            // Migrate 0.3.x, which stored a bare Claude metric name.
+            if let old = d.string(forKey: "pinnedMetric"), !old.isEmpty { return "claude.\(old)" }
+            return "claude.session"
+        }
+        set { d.set(newValue, forKey: "pinnedMetricID") }
     }
 
     static var interval: TimeInterval {
@@ -92,8 +94,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var timer: Timer?
     var menuTimer: Timer?                    // ticks while the menu is open
     var liveRefreshers: [() -> Void] = []    // updates time-sensitive rows in place
-    var state: FetchState = .loading
-    var accountEmail: String?                // signed-in Claude account email (from oauth/profile)
+    var states: [Provider: FetchState] = [:]
+    var claudeEmail: String?                 // signed-in Claude account email
+
     /// A monochrome gauge drawn as a template image (so macOS tints it to the menu
     /// bar). The needle reflects `percent`, so it agrees with the number beside it.
     static func makeGaugeIcon(percent: Double) -> NSImage {
@@ -125,9 +128,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         clearPersistedStatusItemState()   // always reappear, even if dragged off before
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.isVisible = true
-        log("launch (CC version \(claudeCodeVersion()), pin=\(Prefs.pinned.rawValue), every=\(Int(Prefs.interval))s, style=\(Prefs.displayMode.rawValue))")
+        log("launch v\(kVersion) (pin=\(Prefs.pinnedID), every=\(Int(Prefs.interval))s, style=\(Prefs.displayMode.rawValue), claude=\(claudeInstalled()), codex=\(codexInstalled()))")
         statusItem.button?.title = "🍪 …"
         menu.delegate = self          // repopulate on open → fresh "ago"/countdowns
+        menu.autoenablesItems = false // the usage cards handle their own clicks
         statusItem.menu = menu
         renderButton()
         refresh()
@@ -152,20 +156,70 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    // MARK: Fetching
+
     func refresh() {
-        guard let creds = readCredentials() else {
-            log("no credentials in keychain")
-            state = .needsAuth
-            DispatchQueue.main.async { self.render() }
-            return
+        refreshClaude()
+        refreshCodex()
+    }
+
+    private func refreshClaude() {
+        let found = readCredentials()
+        guard claudeInstalled() || found != nil else {
+            states[.claude] = .notConfigured; return
+        }
+        if states[.claude] == nil { states[.claude] = .loading }
+        guard let creds = found else {
+            log("claude: no credentials in keychain")
+            set(.claude, .needsAuth); return
         }
         fetchAccountEmail(creds: creds) { [weak self] email in
             guard let email = email else { return }   // keep the last good value on failure
-            DispatchQueue.main.async { self?.accountEmail = email; self?.render() }
+            DispatchQueue.main.async { self?.claudeEmail = email; self?.render() }
         }
-        fetchUsage(creds: creds) { [weak self] result in
-            DispatchQueue.main.async { self?.state = result; self?.render() }
+        fetchClaudeUsage(creds: creds, email: claudeEmail) { [weak self] result in
+            self?.set(.claude, result)
         }
+    }
+
+    private func refreshCodex() {
+        guard codexInstalled() else { states[.codex] = .notConfigured; return }
+        if states[.codex] == nil { states[.codex] = .loading }
+        guard let creds = readCodexCredentials() else {
+            log("codex: no token in ~/.codex/auth.json")
+            set(.codex, .needsAuth); return
+        }
+        fetchCodexUsage(creds: creds) { [weak self] result in
+            self?.set(.codex, result)
+        }
+    }
+
+    private func set(_ p: Provider, _ s: FetchState) {
+        DispatchQueue.main.async { self.states[p] = s; self.render() }
+    }
+
+    // MARK: Derived state
+
+    /// Providers that exist on this Mac, in display order.
+    var activeProviders: [Provider] {
+        Provider.allCases.filter {
+            if case .notConfigured? = states[$0] { return false }
+            return states[$0] != nil
+        }
+    }
+
+    /// Every window we could pin, across all signed-in providers.
+    var allMetrics: [Metric] {
+        Provider.allCases.flatMap { p -> [Metric] in
+            if case .ok(let u)? = states[p] { return u.metrics }
+            return []
+        }
+    }
+
+    /// The window currently shown in the menu bar, falling back to the first available.
+    var pinnedMetric: Metric? {
+        let all = allMetrics
+        return all.first { $0.id == Prefs.pinnedID } ?? all.first
     }
 
     // MARK: UI
@@ -177,34 +231,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.update()
     }
 
-    /// The window currently chosen for the menu bar, with a sensible fallback.
-    func pinnedWindow(_ u: Usage) -> (win: UsageWindow, name: String)? {
-        switch Prefs.pinned {
-        case .session:   if let w = u.session  { return (w, "Session") }
-        case .week:      if let w = u.weekAll  { return (w, "Week") }
-        case .weekModel: if let w = u.weekModel { return (w, "Week \(u.weekModelLabel ?? "")") }
-        }
-        if let w = u.session { return (w, "Session") }
-        if let w = u.weekAll { return (w, "Week") }
-        return nil
-    }
-
     func renderButton() {
-        switch state {
-        case .loading:
+        if let m = pinnedMetric {
+            applyButton(text: String(format: "%.0f%%", m.pct),
+                        color: severityColor(m.pct), percent: m.pct)
+            return
+        }
+        let all = states.values
+        if all.contains(where: { if case .loading = $0 { return true }; return false }) || all.isEmpty {
             applyButton(text: "…", color: nil, percent: nil)
-        case .needsAuth:
+        } else if all.contains(where: { if case .needsAuth = $0 { return true }; return false }) {
             applyButton(text: "⚠", color: .systemRed, percent: nil)
-        case .error:
+        } else if all.contains(where: { if case .error = $0 { return true }; return false }) {
             applyButton(text: "⚠", color: .systemOrange, percent: nil)
-        case .ok(let u):
-            if let pinned = pinnedWindow(u) {
-                applyButton(text: String(format: "%.0f%%", pinned.win.utilization),
-                            color: severityColor(pinned.win.utilization),
-                            percent: pinned.win.utilization)
-            } else {
-                applyButton(text: "—", color: nil, percent: nil)
-            }
+        } else {
+            applyButton(text: "—", color: nil, percent: nil)
         }
     }
 
@@ -234,16 +275,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         ])
     }
 
-    func metricLabel(_ m: PinnedMetric, _ u: Usage?) -> String {
-        switch m {
-        case .session: return "Session"
-        case .week:    return "Week"
-        case .weekModel:
-            if let lbl = u?.weekModelLabel, !lbl.isEmpty { return "Week \(lbl)" }
-            return "Week (model)"
-        }
-    }
-
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
         populate(menu)
@@ -265,51 +296,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menuTimer = nil
     }
 
+    // MARK: Menu construction
+
     func populate(_ menu: NSMenu) {
         liveRefreshers.removeAll()
-        let usage: Usage? = { if case .ok(let u) = state { return u } else { return nil } }()
 
-        func header(_ s: String) {
-            let it = NSMenuItem(title: s, action: nil, keyEquivalent: "")
-            it.isEnabled = false
-            it.attributedTitle = NSAttributedString(string: s, attributes: [
-                .font: NSFont.systemFont(ofSize: 12, weight: .bold),
-                .foregroundColor: NSColor.secondaryLabelColor,
-            ])
-            menu.addItem(it)
+        let providers = activeProviders
+        if providers.isEmpty {
+            disabled(menu, "Claude Code / Codex not found on this Mac", bold: true)
         }
-
-        switch state {
-        case .loading:
-            header("Loading…")
-        case .needsAuth:
-            header("Not signed in")
-            let it = NSMenuItem(title: "Open Claude Code and sign in, then Refresh", action: nil, keyEquivalent: "")
-            it.isEnabled = false; menu.addItem(it)
-        case .error(let msg):
-            header("Couldn't reach Claude")
-            let it = NSMenuItem(title: msg, action: nil, keyEquivalent: "")
-            it.isEnabled = false; menu.addItem(it)
-        case .ok(let u):
-            var rows: [InfoCardView.Row] = []
-            if let w = u.session { rows.append(.init(name: "Session", pct: w.utilization, resets: w.resetsAt)) }
-            if let w = u.weekAll { rows.append(.init(name: "Week", pct: w.utilization, resets: w.resetsAt)) }
-            if let m = u.weekModel {
-                rows.append(.init(name: "Week \(u.weekModelLabel ?? "")".trimmingCharacters(in: .whitespaces),
-                                  pct: m.utilization, resets: m.resetsAt))
-            }
-            let card = InfoCardView(plan: planDisplayName(u.plan), email: accountEmail, rows: rows, fetchedAt: u.fetchedAt)
-            let cardItem = NSMenuItem()
-            cardItem.isEnabled = false
-            cardItem.view = card
-            liveRefreshers.append { [weak card] in card?.refresh() }
-            menu.addItem(cardItem)
+        for (i, p) in providers.enumerated() {
+            if i > 0 { menu.addItem(.separator()) }
+            addSection(menu, for: p)
         }
 
         menu.addItem(.separator())
         menu.addItem(item("Refresh Now", #selector(refreshClicked), "r"))
-        menu.addItem(item("Open Usage in Browser…", #selector(openUsage), ""))
-        menu.addItem(pinSubmenuItem(usage))
+        for p in providers {
+            let title = providers.count > 1 ? "Open \(p.label) Usage…" : "Open Usage in Browser…"
+            let it = item(title, #selector(openUsage(_:)), "")
+            it.representedObject = p.rawValue
+            menu.addItem(it)
+        }
+        menu.addItem(pinSubmenuItem())
         menu.addItem(intervalSubmenuItem())
         menu.addItem(displaySubmenuItem())
         let login = item("Start at Login", #selector(toggleLogin), "")
@@ -319,15 +328,70 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(item("Quit Cookie Monster", #selector(quit), "q"))
     }
 
-    func pinSubmenuItem(_ usage: Usage?) -> NSMenuItem {
-        let sub = NSMenu()
-        for metric in PinnedMetric.allCases {
-            let it = NSMenuItem(title: metricLabel(metric, usage), action: #selector(setPinned(_:)), keyEquivalent: "")
-            it.target = self
-            it.representedObject = metric.rawValue
-            it.state = (Prefs.pinned == metric) ? .on : .off
-            sub.addItem(it)
+    private func addSection(_ menu: NSMenu, for p: Provider) {
+        switch states[p] ?? .loading {
+        case .notConfigured:
+            break
+        case .loading:
+            disabled(menu, "\(p.label) — loading…", bold: true)
+        case .needsAuth:
+            disabled(menu, "\(p.label) — not signed in", bold: true)
+            disabled(menu, p.signInHint, bold: false)
+        case .error(let msg):
+            disabled(menu, "\(p.label) — couldn't reach usage API", bold: true)
+            disabled(menu, msg, bold: false)
+        case .ok(let u):
+            let rows = u.metrics.map {
+                InfoCardView.Row(id: $0.id, name: $0.name, pct: $0.pct, resets: $0.resets)
+            }
+            // claudeEmail arrives on its own request, so prefer the freshest value.
+            let email = (p == .claude ? claudeEmail : nil) ?? u.email
+            let card = InfoCardView(title: "\(u.provider.label) \(u.plan)",
+                                    email: email,
+                                    rows: rows,
+                                    fetchedAt: u.fetchedAt,
+                                    pinnedID: pinnedMetric?.id) { [weak self] id in
+                self?.pick(id)
+            }
+            let cardItem = NSMenuItem()
+            cardItem.isEnabled = true
+            cardItem.view = card
+            liveRefreshers.append { [weak card] in card?.refresh() }
+            menu.addItem(cardItem)
         }
+    }
+
+    private func disabled(_ menu: NSMenu, _ s: String, bold: Bool) {
+        let it = NSMenuItem(title: s, action: nil, keyEquivalent: "")
+        it.isEnabled = false
+        it.attributedTitle = NSAttributedString(string: s, attributes: [
+            .font: NSFont.systemFont(ofSize: 12, weight: bold ? .bold : .regular),
+            .foregroundColor: bold ? NSColor.secondaryLabelColor : NSColor.tertiaryLabelColor,
+        ])
+        menu.addItem(it)
+    }
+
+    /// Lists every pinnable window, grouped by provider.
+    func pinSubmenuItem() -> NSMenuItem {
+        let sub = NSMenu()
+        sub.autoenablesItems = false
+        let current = pinnedMetric?.id
+        var shown = 0
+        for p in Provider.allCases {
+            guard case .ok(let u)? = states[p], !u.metrics.isEmpty else { continue }
+            if shown > 0 { sub.addItem(.separator()) }
+            disabled(sub, "\(u.provider.label) \(u.plan)", bold: true)
+            for m in u.metrics {
+                let it = NSMenuItem(title: "\(m.name) — \(String(format: "%.0f%%", m.pct))",
+                                    action: #selector(setPinned(_:)), keyEquivalent: "")
+                it.target = self
+                it.representedObject = m.id
+                it.state = (current == m.id) ? .on : .off
+                sub.addItem(it)
+            }
+            shown += 1
+        }
+        if shown == 0 { disabled(sub, "Nothing to pin yet", bold: false) }
         let parent = NSMenuItem(title: "Pin to Menu Bar", action: nil, keyEquivalent: "")
         parent.submenu = sub
         return parent
@@ -335,6 +399,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func intervalSubmenuItem() -> NSMenuItem {
         let sub = NSMenu()
+        sub.autoenablesItems = false
         for choice in intervalChoices {
             let it = NSMenuItem(title: choice.label, action: #selector(setInterval(_:)), keyEquivalent: "")
             it.target = self
@@ -349,6 +414,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func displaySubmenuItem() -> NSMenuItem {
         let sub = NSMenu()
+        sub.autoenablesItems = false
         for mode in DisplayMode.allCases {
             let it = NSMenuItem(title: mode.label, action: #selector(setDisplayMode(_:)), keyEquivalent: "")
             it.target = self
@@ -367,14 +433,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return it
     }
 
-    @objc func refreshClicked() { state = .loading; render(); refresh() }
-    @objc func openUsage() { NSWorkspace.shared.open(URL(string: "https://claude.ai/settings/usage")!) }
+    // MARK: Actions
+
+    func pick(_ id: String) {
+        Prefs.pinnedID = id
+        log("pin → \(id)")
+        render()
+    }
+
+    @objc func refreshClicked() {
+        for p in activeProviders { states[p] = .loading }
+        render(); refresh()
+    }
+
+    @objc func openUsage(_ sender: NSMenuItem) {
+        let p = (sender.representedObject as? String).flatMap(Provider.init(rawValue:)) ?? .claude
+        NSWorkspace.shared.open(p.usageURL)
+    }
 
     @objc func setPinned(_ sender: NSMenuItem) {
-        guard let raw = sender.representedObject as? String, let m = PinnedMetric(rawValue: raw) else { return }
-        Prefs.pinned = m
-        log("pin → \(m.rawValue)")
-        render()
+        guard let id = sender.representedObject as? String else { return }
+        pick(id)
     }
 
     @objc func setInterval(_ sender: NSMenuItem) {
@@ -399,17 +478,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func quit() { NSApp.terminate(nil) }
 }
 
-// MARK: - Info card (custom-drawn dropdown header: plan, email, usage bars, updated)
+// MARK: - Info card (custom-drawn dropdown section: plan, email, usage bars, updated)
 
 final class InfoCardView: NSView {
-    struct Row { let name: String; let pct: Double; let resets: Date? }
-    private let plan: String
+    struct Row { let id: String; let name: String; let pct: Double; let resets: Date? }
+
+    private let title: String
     private let email: String?
     private let rows: [Row]
     private let fetchedAt: Date
+    private let pinnedID: String?
+    private let onPick: (String) -> Void
+    /// Filled during layout so a click can find the row underneath it.
+    private var hitRects: [(rect: NSRect, id: String)] = []
 
-    init(plan: String, email: String?, rows: [Row], fetchedAt: Date) {
-        self.plan = plan; self.email = email; self.rows = rows; self.fetchedAt = fetchedAt
+    init(title: String, email: String?, rows: [Row], fetchedAt: Date,
+         pinnedID: String?, onPick: @escaping (String) -> Void) {
+        self.title = title; self.email = email; self.rows = rows
+        self.fetchedAt = fetchedAt; self.pinnedID = pinnedID; self.onPick = onPick
         super.init(frame: NSRect(x: 0, y: 0, width: 300, height: 10))
         setFrameSize(NSSize(width: 300, height: layout(false)))   // exact fit to content
     }
@@ -417,19 +503,39 @@ final class InfoCardView: NSView {
     override var isFlipped: Bool { true }        // lay out top→down
     func refresh() { needsDisplay = true }        // recompute countdowns / "Updated …" on redraw
 
+    // Clicking a usage row pins it to the menu bar, then closes the menu.
+    override func mouseDown(with event: NSEvent) {
+        let p = convert(event.locationInWindow, from: nil)
+        guard let hit = hitRects.first(where: { $0.rect.contains(p) }) else { return }
+        onPick(hit.id)
+        enclosingMenuItem?.menu?.cancelTracking()
+    }
+
     private func t(_ s: String, _ f: NSFont, _ c: NSColor) -> NSAttributedString {
         NSAttributedString(string: s, attributes: [.font: f, .foregroundColor: c])
     }
     private func left(_ s: NSAttributedString, _ x: CGFloat, _ y: CGFloat) { s.draw(at: NSPoint(x: x, y: y)) }
     private func right(_ s: NSAttributedString, _ rx: CGFloat, _ y: CGFloat) { s.draw(at: NSPoint(x: rx - s.size().width, y: y)) }
 
+    /// A small "PINNED" pill marking the row that's showing in the menu bar.
+    private func pill(_ x: CGFloat, _ y: CGFloat) -> CGFloat {
+        let s = t("PINNED", .systemFont(ofSize: 9, weight: .bold), .controlAccentColor)
+        let w = s.size().width + 12
+        let r = NSRect(x: x, y: y + 2, width: w, height: 14)
+        NSColor.controlAccentColor.withAlphaComponent(0.15).setFill()
+        NSBezierPath(roundedRect: r, xRadius: 7, yRadius: 7).fill()
+        s.draw(at: NSPoint(x: x + 6, y: y + 4))
+        return w
+    }
+
     /// Single source of truth for layout: with `paint` false it only advances `y`
     /// (so the frame fits exactly); with `paint` true it draws.
     @discardableResult
     private func layout(_ paint: Bool) -> CGFloat {
+        hitRects.removeAll()
         let x: CGFloat = 16, w = bounds.width, cw = w - x * 2
         var y: CGFloat = 13
-        if paint { left(t("Claude \(plan)", .systemFont(ofSize: 13, weight: .bold), .secondaryLabelColor), x, y) }
+        if paint { left(t(title, .systemFont(ofSize: 13, weight: .bold), .secondaryLabelColor), x, y) }
         y += 18
         if let email = email {
             if paint { left(t(email, .systemFont(ofSize: 12, weight: .regular), .tertiaryLabelColor), x, y) }
@@ -439,9 +545,18 @@ final class InfoCardView: NSView {
         if paint { NSColor.quaternaryLabelColor.setFill(); NSRect(x: x, y: y, width: cw, height: 1).fill() }
         y += 13
         for (i, r) in rows.enumerated() {
+            let isPinned = (r.id == pinnedID)
+            let block = NSRect(x: x - 8, y: y - 7, width: cw + 16, height: 65)
+            hitRects.append((block, r.id))
             if paint {
-                left(t(r.name, .systemFont(ofSize: 13, weight: .medium), .labelColor), x, y)
-                right(t(String(format: "%.0f%%", r.pct), .monospacedDigitSystemFont(ofSize: 13, weight: .semibold), severityColor(r.pct)), w - x, y)
+                if isPinned {
+                    NSColor.controlAccentColor.withAlphaComponent(0.10).setFill()
+                    NSBezierPath(roundedRect: block, xRadius: 8, yRadius: 8).fill()
+                }
+                let name = t(r.name, .systemFont(ofSize: 13, weight: isPinned ? .semibold : .medium), .labelColor)
+                left(name, x, y)
+                if isPinned { _ = pill(x + name.size().width + 8, y) }
+                right(t(String(format: "%.0f%%", r.pct), .monospacedDigitSystemFont(ofSize: 13, weight: .bold), .labelColor), w - x, y)
             }
             y += 25
             if paint {

@@ -10,31 +10,50 @@
 ![Swift](https://img.shields.io/badge/Swift-6-orange?logo=swift&logoColor=white)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen)](CONTRIBUTING.md)
 
-A tiny native macOS menu-bar app that shows your **Claude subscription usage** —
-the same numbers as Claude Code's "Plan usage limits" panel — right in your menu bar.
+A tiny native macOS menu-bar app that shows your **Claude and Codex subscription
+usage** — the same numbers as Claude Code's "Plan usage limits" panel and Codex's
+`/status` — right in your menu bar.
 
 > **Why "Cookie Monster"?** It started life as *Token Monster* — it watches Claude
 > gobble through your tokens. "Cookie Monster" just has the better appetite. 🍪
 
 ```
-🍪 27%      ← your current 5-hour session usage, color-coded
+🍪 27%      ← whichever usage window you pinned, color-coded
 ```
 
-Click it for the full breakdown:
+Click it for the full breakdown — one section per subscription you're signed
+into. **Click any row to pin it to the menu bar:**
 
 ```
 Claude Max
+you@example.com
 ────────────────────────────────────────────
-Session     ███░░░░░░░  27%   resets in 3h 24m
-Week        ███░░░░░░░  29%   resets in 5d 4h
-Week Sonnet ░░░░░░░░░░   0%   resets in 5d 4h
+Session  PINNED  ███░░░░░░░  27%  resets in 3h 24m
+Week             ███░░░░░░░  29%  resets in 5d 4h
+Week Sonnet      ░░░░░░░░░░   0%  resets in 5d 4h
 ────────────────────────────────────────────
 Updated 12s ago
+
+Codex Pro
+you@example.com
+────────────────────────────────────────────
+5h               ████░░░░░░  42%  resets in 1h 59m
+Weekly           █░░░░░░░░░  12%  resets in 5d 23h
+────────────────────────────────────────────
+Updated 12s ago
+
 Refresh Now              ⌘R
-Open Usage in Browser…
+Open Claude Usage…
+Open Codex Usage…
+Pin to Menu Bar          ▸
+Update Every             ▸
+Menu Bar Style           ▸
 Start at Login            ✓
 Quit Cookie Monster      ⌘Q
 ```
+
+Sections only appear for the tools you actually have installed — Claude-only and
+Codex-only setups both show a single section.
 
 ## Install
 
@@ -61,26 +80,34 @@ cd cookie-monster
 
 ## How it works
 
-- Reads your existing **Claude Code OAuth token** from the login keychain
-  (`Claude Code-credentials`) at runtime.
-- Polls the (undocumented) `https://api.anthropic.com/api/oauth/usage` endpoint
-  every 60 seconds — the same endpoint that powers `/usage` inside Claude Code —
-  with a `claude-code/<ver>` User-Agent and the `anthropic-beta: oauth-2025-04-20`
-  header.
-- Shows the 5-hour **session** window in the bar (green < 50%, orange < 80%,
-  red ≥ 80%), with weekly windows in the dropdown.
+**Claude** — reads your existing **Claude Code OAuth token** from the login
+keychain (`Claude Code-credentials`) and polls the (undocumented)
+`https://api.anthropic.com/api/oauth/usage` endpoint, the same one that powers
+`/usage` inside Claude Code, with a `claude-code/<ver>` User-Agent and the
+`anthropic-beta: oauth-2025-04-20` header.
 
-It is **read-only on your credentials**: it never writes to the keychain, never
-refreshes or modifies your token, and never logs the token or the raw API
-response. A small diagnostic log (status codes + percentages only) is kept at
-`~/.cookie-monster/cookie-monster.log`.
+**Codex** — reads the ChatGPT OAuth token the Codex CLI stores in
+`~/.codex/auth.json` and polls `https://chatgpt.com/backend-api/codex/usage`
+with a `codex_cli_rs/<ver>` User-Agent, the `originator: codex_cli_rs` header and
+your `chatgpt-account-id`. That's the same data behind Codex's own rate-limit
+display.
+
+Both are polled every 60 seconds (configurable). The pinned window's percentage
+goes in the bar, color-coded green < 50%, orange < 80%, red ≥ 80%.
+
+It is **read-only on your credentials**: it never writes to the keychain or to
+`~/.codex/auth.json`, never refreshes or modifies your tokens, and never logs a
+token or a raw API response. A small diagnostic log (status codes + percentages
+only) is kept at `~/.cookie-monster/cookie-monster.log`.
 
 ## Settings
 
 All three are in the 🍪 menu and persist across restarts:
 
-- **Pin to Menu Bar** — choose which window's percentage shows in the bar:
-  **Session** (default), **Week**, or **Week (model)**.
+- **Pin to Menu Bar** — choose which window's percentage shows in the bar. Every
+  window from every signed-in subscription is listed, grouped by provider
+  (Claude **Session** / **Week** / **Week (model)**, Codex **5h** / **Weekly**).
+  You can also just **click a row in the dropdown** to pin it.
 - **Update Every** — how often it polls: 30 seconds, 1 / 2 / 5 / 15 minutes
   (default 1 minute).
 - **Menu Bar Style** — **Default** (a monochrome gauge whose needle tracks your
@@ -93,26 +120,29 @@ All three are in the 🍪 menu and persist across restarts:
 ./uninstall.sh
 ```
 
-Removes the app, the login item, and the log directory. Your Claude credentials
-are left untouched.
+Removes the app, the login item, and the log directory. Your Claude and Codex
+credentials are left untouched.
 
 ## Limitations
 
-- **macOS 13+ only**, and requires a Claude subscription signed into Claude Code
-  (Pro / Max / Team). It reports whatever account Claude Code is authenticated as.
-- **Token refresh:** if the menu bar shows `🍪 ⚠` (red), your OAuth token
-  expired — run `claude` once to refresh it, then click **Refresh Now**. Cookie
-  Monster intentionally does not refresh tokens itself, to avoid ever touching
-  your stored credentials.
-- The usage endpoint is **undocumented** and may change without notice. If the
+- **macOS 13+ only.** Needs a Claude subscription signed into Claude Code
+  (Pro / Max / Team) and/or a ChatGPT subscription signed into the Codex CLI
+  (Plus / Pro / Business). It reports whatever accounts those CLIs are
+  authenticated as.
+- **Token refresh:** if a section shows *not signed in*, that provider's OAuth
+  token expired — run `claude` or `codex` once to refresh it, then click
+  **Refresh Now**. Cookie Monster intentionally does not refresh tokens itself,
+  to avoid ever touching your stored credentials.
+- Both usage endpoints are **undocumented** and may change without notice. If the
   numbers stop appearing, check the field names in [`src/Core.swift`](src/Core.swift)
-  (`five_hour`, `seven_day`, `seven_day_opus`/`seven_day_sonnet`).
+  (`five_hour` / `seven_day` / `seven_day_opus` / `seven_day_sonnet` for Claude,
+  `rate_limit.primary_window` / `secondary_window` for Codex).
 
 ## Repo layout
 
 | Path | What |
 |------|------|
-| [`src/Core.swift`](src/Core.swift) | Shared logic — keychain read, usage fetch, formatting |
+| [`src/Core.swift`](src/Core.swift) | Shared logic — credential reads, Claude + Codex usage fetch, formatting |
 | [`src/App.swift`](src/App.swift)   | The menu-bar UI (AppKit `NSStatusItem`) |
 | [`build.sh`](build.sh)             | Compile the `.app` bundle |
 | [`install.sh`](install.sh) / [`uninstall.sh`](uninstall.sh) | Install/remove to `~/Applications` |

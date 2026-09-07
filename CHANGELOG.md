@@ -4,6 +4,28 @@ All notable changes to Cookie Monster are documented here. The format is based o
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.4.0] — 2026-09-07
+
+### Added
+- **Codex subscription support.** Cookie Monster now reads the ChatGPT OAuth
+  token the Codex CLI stores in `~/.codex/auth.json` (read-only, never rewritten)
+  and polls `https://chatgpt.com/backend-api/codex/usage` for your Codex
+  rate-limit windows. The dropdown gains a **Codex** section with your plan,
+  account email, and one bar per window (`5h`, `Weekly`, …).
+- **Pin to Menu Bar** now lists every window from *both* providers, grouped by
+  subscription and annotated with its current percentage.
+- **Click a usage row in the dropdown** to pin it to the menu bar. The pinned row
+  is highlighted and tagged `PINNED`.
+- Separate **Open Claude Usage…** / **Open Codex Usage…** items when both
+  subscriptions are present.
+
+### Changed
+- Sections are shown only for tools actually installed on the Mac, so a
+  Claude-only or Codex-only setup looks unchanged.
+- Usage percentages in the dropdown are drawn in the label color (bold) instead
+  of the severity color — the green was hard to read on the light menu material.
+  The bars keep the green/orange/red coding.
+
 ## [0.3.0] — 2026-07-29
 
 ### Added
