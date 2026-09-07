@@ -219,7 +219,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// The window currently shown in the menu bar, falling back to the first available.
     var pinnedMetric: Metric? {
         let all = allMetrics
-        return all.first { $0.id == Prefs.pinnedID } ?? all.first
+        if let m = all.first(where: { $0.id == Prefs.pinnedID }) { return m }
+        // Metric ids can change between versions. Keep the user on the provider they
+        // pinned rather than silently jumping to a different subscription.
+        let provider = Prefs.pinnedID.split(separator: ".").first.map(String.init) ?? ""
+        if let p = Provider(rawValue: provider), let m = all.first(where: { $0.provider == p }) { return m }
+        return all.first
     }
 
     // MARK: UI
@@ -342,8 +347,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             disabled(menu, msg, bold: false)
         case .ok(let u):
             let rows = u.metrics.map {
-                InfoCardView.Row(id: $0.id, name: $0.name, detail: $0.detail,
-                                 pct: $0.pct, resets: $0.resets)
+                InfoCardView.Row(id: $0.id, name: $0.name, pct: $0.pct, resets: $0.resets)
             }
             // claudeEmail arrives on its own request, so prefer the freshest value.
             let email = (p == .claude ? claudeEmail : nil) ?? u.email
@@ -383,8 +387,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if shown > 0 { sub.addItem(.separator()) }
             disabled(sub, "\(u.provider.label) \(u.plan)", bold: true)
             for m in u.metrics {
-                let qualifier = m.detail.map { " \($0)" } ?? ""
-                let it = NSMenuItem(title: "\(m.name)\(qualifier) — \(String(format: "%.0f%%", m.pct))",
+                let it = NSMenuItem(title: "\(m.name) — \(String(format: "%.0f%%", m.pct))",
                                     action: #selector(setPinned(_:)), keyEquivalent: "")
                 it.target = self
                 it.representedObject = m.id
@@ -483,7 +486,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 // MARK: - Info card (custom-drawn dropdown section: plan, email, usage bars, updated)
 
 final class InfoCardView: NSView {
-    struct Row { let id: String; let name: String; let detail: String?; let pct: Double; let resets: Date? }
+    struct Row { let id: String; let name: String; let pct: Double; let resets: Date? }
 
     private let title: String
     private let email: String?
@@ -498,8 +501,8 @@ final class InfoCardView: NSView {
          pinnedID: String?, onPick: @escaping (String) -> Void) {
         self.title = title; self.email = email; self.rows = rows
         self.fetchedAt = fetchedAt; self.pinnedID = pinnedID; self.onPick = onPick
-        super.init(frame: NSRect(x: 0, y: 0, width: 340, height: 10))
-        setFrameSize(NSSize(width: 340, height: layout(false)))   // exact fit to content
+        super.init(frame: NSRect(x: 0, y: 0, width: 300, height: 10))
+        setFrameSize(NSSize(width: 300, height: layout(false)))   // exact fit to content
     }
     required init?(coder: NSCoder) { fatalError() }
     override var isFlipped: Bool { true }        // lay out top→down
@@ -555,10 +558,6 @@ final class InfoCardView: NSView {
                 }
                 let name = t(r.name, .systemFont(ofSize: 13, weight: isPinned ? .semibold : .medium), .labelColor)
                 left(name, x, y)
-                if let d = r.detail {
-                    left(t(d, .systemFont(ofSize: 11, weight: .regular), .tertiaryLabelColor),
-                         x + name.size().width + 7, y + 2)
-                }
                 right(t(String(format: "%.0f%%", r.pct), .monospacedDigitSystemFont(ofSize: 13, weight: .bold), .labelColor), w - x, y)
             }
             y += 25

@@ -37,9 +37,8 @@ Updated 12s ago
 Codex Pro
 you@example.com
 ────────────────────────────────────────────
-5h  GPT-5.3-Codex-Spark  ███░░░░░░░  34%  resets in 4h 9m
-Weekly                   █░░░░░░░░░   1%  resets in 6d 21h
-Weekly  GPT-5.3-Codex-Spark  █░░░░░░░  12%  resets in 6d 21h
+5h               ███░░░░░░░  34%  resets in 4h 8m
+Weekly           █░░░░░░░░░   1%  resets in 6d 20h
 ────────────────────────────────────────────
 Updated 12s ago
 
@@ -107,8 +106,7 @@ All three are in the 🍪 menu and persist across restarts:
 
 - **Pin to Menu Bar** — choose which window's percentage shows in the bar. Every
   window from every signed-in subscription is listed, grouped by provider
-  (Claude **Session** / **Week** / **Week (model)**, Codex **5h** / **Weekly**
-  plus any per-model caps), shortest window first.
+  (Claude **Session** / **Week** / **Week (model)**, Codex **5h** / **Weekly**).
   You can also just **click a row in the dropdown** to pin it.
 - **Update Every** — how often it polls: 30 seconds, 1 / 2 / 5 / 15 minutes
   (default 1 minute).
@@ -141,8 +139,9 @@ credentials are left untouched.
   `rate_limit`, `additional_rate_limits` and `code_review_rate_limit` for Codex).
 - **Codex windows vary by plan.** On Pro, `rate_limit.secondary_window` is null
   and the account-wide window is the *weekly* one — the 5-hour cap is reported
-  inside `additional_rate_limits`, per model. Cookie Monster reads all of them,
-  so what you see depends on what your plan actually meters.
+  inside `additional_rate_limits`, per model. Cookie Monster reads every block and
+  shows the most-consumed 5h and weekly window, so the two bars always reflect
+  whichever meter is closest to cutting you off.
 
 ## Repo layout
 

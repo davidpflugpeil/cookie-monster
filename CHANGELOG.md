@@ -11,12 +11,12 @@ All notable changes to Cookie Monster are documented here. The format is based o
   token the Codex CLI stores in `~/.codex/auth.json` (read-only, never rewritten)
   and polls `https://chatgpt.com/backend-api/codex/usage` for your Codex
   rate-limit windows. The dropdown gains a **Codex** section with your plan,
-  account email, and one bar per window (`5h`, `Weekly`, …) — including the
-  **per-model caps** in `additional_rate_limits` and the code-review budget.
-  On Pro plans the 5-hour window lives *only* in the per-model limits
-  (`rate_limit.secondary_window` is null and the account-wide window is the
-  weekly one), so parsing `rate_limit` alone would hide it. Windows are listed
-  shortest-first and qualified with the model they apply to.
+  account email, and a **5h** and **Weekly** bar. Codex reports the same two
+  clocks in several places — the account-wide block, one entry per metered model
+  (`additional_rate_limits`), and code review — so Cookie Monster reads all of
+  them and shows the most-consumed window of each length. That matters on Pro,
+  where `rate_limit.secondary_window` is null and the account-wide window is the
+  *weekly* one: the 5-hour cap exists only in the per-model limits.
 - **Pin to Menu Bar** now lists every window from *both* providers, grouped by
   subscription and annotated with its current percentage.
 - **Click a usage row in the dropdown** to pin it to the menu bar. The pinned row
