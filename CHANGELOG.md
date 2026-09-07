@@ -4,6 +4,20 @@ All notable changes to Cookie Monster are documented here. The format is based o
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.4.3] — 2026-09-07
+
+### Changed
+- **Codex shows only your plan's own rate-limit windows.** Codex's UI also lists
+  the per-model caps in `additional_rate_limits`, but those meter one specific
+  model: on Pro the 5h clock there belongs to `GPT-5.3-Codex-Spark` and reads 0%
+  whether or not you're near your real limit, so it's noise in a menu-bar summary.
+  Only the plan bucket (`rate_limit`) is shown — a single `Weekly` bar on Pro,
+  `5h` + `Weekly` on Plus.
+
+### Fixed
+- A pinned window whose id no longer exists is rewritten once its provider reports
+  successfully, instead of silently riding the fallback with a dead id stored.
+
 ## [0.4.2] — 2026-09-07
 
 ### Fixed
