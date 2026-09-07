@@ -4,6 +4,18 @@ All notable changes to Cookie Monster are documented here. The format is based o
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.4.1] — 2026-09-07
+
+### Fixed
+- **Codex now shows only your plan's own rate-limit windows.** 0.4.0 also surfaced
+  entries from `additional_rate_limits`, which are caps on *individual models*
+  (and on code review) rather than your subscription's budget. On Pro that
+  produced a headline `5h` row taken from the `GPT-5.3-Codex-Spark` bucket — a
+  model you may never invoke, so it sits at 0% and reads as "session budget
+  untouched" when your plan has no 5-hour window at all. Only
+  `rate_limit.primary_window` / `secondary_window` are read now, so a Pro account
+  correctly shows a single `Weekly` bar and a Plus account shows `5h` + `Weekly`.
+
 ## [0.4.0] — 2026-09-07
 
 ### Added
