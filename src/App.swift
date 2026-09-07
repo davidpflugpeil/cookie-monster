@@ -96,6 +96,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var liveRefreshers: [() -> Void] = []    // updates time-sensitive rows in place
     var states: [Provider: FetchState] = [:]
     var claudeEmail: String?                 // signed-in Claude account email
+    var menuIsOpen = false                   // drives the in-place rebuild in render()
 
     /// A monochrome gauge drawn as a template image (so macOS tints it to the menu
     /// bar). The needle reflects `percent`, so it agrees with the number beside it.
@@ -166,7 +167,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func refreshClaude() {
         let found = readCredentials()
         guard claudeInstalled() || found != nil else {
-            states[.claude] = .notConfigured; return
+            set(.claude, .notConfigured); return
         }
         if states[.claude] == nil { states[.claude] = .loading }
         guard let creds = found else {
@@ -183,7 +184,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func refreshCodex() {
-        guard codexInstalled() else { states[.codex] = .notConfigured; return }
+        guard codexInstalled() else { set(.codex, .notConfigured); return }
         if states[.codex] == nil { states[.codex] = .loading }
         guard let creds = readCodexCredentials() else {
             log("codex: no token in ~/.codex/auth.json")
@@ -229,11 +230,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: UI
 
-    func render() {
+    /// `rebuildOpenMenu` is false on the click-to-pin path, where the menu is already
+    /// being dismissed and rebuilding it would just churn items on the way out.
+    func render(rebuildOpenMenu: Bool = true) {
         renderButton()
-        // The menu rebuilds itself each time it opens (menuNeedsUpdate);
-        // update() also refreshes it in place if it happens to be showing.
-        menu.update()
+        // NSMenu.update() is documented to do nothing unless autoenablesItems is true,
+        // and menuNeedsUpdate only fires when a tracking session starts — so a fetch
+        // landing while the dropdown is open would otherwise leave it frozen on the
+        // old snapshot (including a stale "Updated 3m ago" ticking off a stale date).
+        guard rebuildOpenMenu, menuIsOpen else { return }
+        menu.removeAllItems()
+        populate(menu)
     }
 
     func renderButton() {
@@ -288,6 +295,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // While the menu is open, tick the "Updated …" counter (and countdowns) every
     // second. The timer must run in .common mode to fire during menu tracking.
     func menuWillOpen(_ menu: NSMenu) {
+        menuIsOpen = true
         menuTimer?.invalidate()
         let t = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
             self?.liveRefreshers.forEach { $0() }
@@ -297,6 +305,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func menuDidClose(_ menu: NSMenu) {
+        menuIsOpen = false
         menuTimer?.invalidate()
         menuTimer = nil
     }
@@ -347,7 +356,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             disabled(menu, msg, bold: false)
         case .ok(let u):
             let rows = u.metrics.map {
-                InfoCardView.Row(id: $0.id, name: $0.name, pct: $0.pct, resets: $0.resets)
+                InfoCardView.Row(id: $0.id, name: $0.name, detail: $0.detail,
+                                 pct: $0.pct, resets: $0.resets)
             }
             // claudeEmail arrives on its own request, so prefer the freshest value.
             let email = (p == .claude ? claudeEmail : nil) ?? u.email
@@ -387,7 +397,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if shown > 0 { sub.addItem(.separator()) }
             disabled(sub, "\(u.provider.label) \(u.plan)", bold: true)
             for m in u.metrics {
-                let it = NSMenuItem(title: "\(m.name) — \(String(format: "%.0f%%", m.pct))",
+                let qualifier = m.detail.map { " (\($0))" } ?? ""
+                let it = NSMenuItem(title: "\(m.name)\(qualifier) — \(String(format: "%.0f%%", m.pct))",
                                     action: #selector(setPinned(_:)), keyEquivalent: "")
                 it.target = self
                 it.representedObject = m.id
@@ -443,7 +454,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func pick(_ id: String) {
         Prefs.pinnedID = id
         log("pin → \(id)")
-        render()
+        render(rebuildOpenMenu: false)
     }
 
     @objc func refreshClicked() {
@@ -486,7 +497,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 // MARK: - Info card (custom-drawn dropdown section: plan, email, usage bars, updated)
 
 final class InfoCardView: NSView {
-    struct Row { let id: String; let name: String; let pct: Double; let resets: Date? }
+    struct Row { let id: String; let name: String; let detail: String?; let pct: Double; let resets: Date? }
 
     private let title: String
     private let email: String?
@@ -512,8 +523,8 @@ final class InfoCardView: NSView {
     override func mouseDown(with event: NSEvent) {
         let p = convert(event.locationInWindow, from: nil)
         guard let hit = hitRects.first(where: { $0.rect.contains(p) }) else { return }
-        onPick(hit.id)
         enclosingMenuItem?.menu?.cancelTracking()
+        onPick(hit.id)
     }
 
     private func t(_ s: String, _ f: NSFont, _ c: NSColor) -> NSAttributedString {
@@ -558,6 +569,10 @@ final class InfoCardView: NSView {
                 }
                 let name = t(r.name, .systemFont(ofSize: 13, weight: isPinned ? .semibold : .medium), .labelColor)
                 left(name, x, y)
+                if let d = r.detail {
+                    left(t(d, .systemFont(ofSize: 11, weight: .regular), .tertiaryLabelColor),
+                         x + name.size().width + 7, y + 2)
+                }
                 right(t(String(format: "%.0f%%", r.pct), .monospacedDigitSystemFont(ofSize: 13, weight: .bold), .labelColor), w - x, y)
             }
             y += 25

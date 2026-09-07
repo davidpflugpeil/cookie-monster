@@ -14,9 +14,20 @@ All notable changes to Cookie Monster are documented here. The format is based o
   account email, and a **5h** and **Weekly** bar. Codex reports the same two
   clocks in several places — the account-wide block, one entry per metered model
   (`additional_rate_limits`), and code review — so Cookie Monster reads all of
-  them and shows the most-consumed window of each length. That matters on Pro,
-  where `rate_limit.secondary_window` is null and the account-wide window is the
-  *weekly* one: the 5-hour cap exists only in the per-model limits.
+  them and shows one row per window length. Only the plan's own window gets an
+  unqualified label — a per-model cap is tagged with the model it meters, so
+  `5h — 0%` can't be misread as an untouched session budget when it only means
+  that one model went unused. This matters on Pro, where `rate_limit.secondary_window`
+  is null, the account-wide window is the *weekly* one, and the only 5-hour window
+  in the response belongs to a per-model bucket.
+
+### Fixed
+- The open dropdown refreshes when a fetch lands. `NSMenu.update()` does nothing
+  unless `autoenablesItems` is true, and `menuNeedsUpdate` only fires when a
+  tracking session starts, so the menu used to freeze on the snapshot it opened
+  with — including an "Updated …" counter ticking off a stale timestamp.
+- The menu-bar item no longer sticks on "…" forever when neither Claude Code nor
+  the Codex CLI is installed (that state transition skipped the render).
 - **Pin to Menu Bar** now lists every window from *both* providers, grouped by
   subscription and annotated with its current percentage.
 - **Click a usage row in the dropdown** to pin it to the menu bar. The pinned row
