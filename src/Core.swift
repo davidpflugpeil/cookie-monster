@@ -15,7 +15,7 @@ let kLoginPlistLabel = "com.pflugpeil.cookiemonster"
 let kPollInterval: TimeInterval = 60
 let kLogDir = (NSHomeDirectory() as NSString).appendingPathComponent(".cookie-monster")
 let kLogFile = (kLogDir as NSString).appendingPathComponent("cookie-monster.log")
-let kVersion = "0.4.1"
+let kVersion = "0.4.2"
 
 // MARK: - Logging (no secrets ever pass through here)
 
@@ -62,6 +62,7 @@ struct Metric {
     let id: String          // e.g. "claude.session", "codex.primary"
     let provider: Provider
     let name: String        // "Session", "Week", "5h", "Weekly"
+    let detail: String?     // the bucket a window belongs to, when it isn't the plan's own
     let pct: Double         // 0…100
     let resets: Date?
 }
@@ -278,7 +279,7 @@ func fetchClaudeUsage(creds: Credentials, email: String?, completion: @escaping 
         var metrics: [Metric] = []
         func add(_ id: String, _ name: String, _ w: (pct: Double, resets: Date?)?) {
             guard let w = w else { return }
-            metrics.append(Metric(id: id, provider: .claude, name: name,
+            metrics.append(Metric(id: id, provider: .claude, name: name, detail: nil,
                                   pct: w.pct, resets: w.resets))
         }
         add("claude.session", "Session", parseWindow(root["five_hour"]))
@@ -346,21 +347,50 @@ func fetchCodexUsage(creds: CodexCredentials, completion: @escaping (FetchState)
             completion(.error("HTTP \(http.statusCode)")); return
         }
 
-        // Only the account-wide `rate_limit` block is the plan's own budget, and it is
-        // the only thing we show. `additional_rate_limits` holds caps for individual
-        // models (and code review) — surfacing one of those as "5h" claims a session
-        // budget the plan may not have: on Pro the account block has no 5h window at
-        // all, and the only 18000s window in the response belongs to a model the user
-        // may never touch, so it sits at 0% and reads as "plenty left".
-        let limits = (root["rate_limit"] as? [String: Any]) ?? [:]
-        var metrics: [Metric] = []
-        for key in ["primary_window", "secondary_window"] {
-            guard let w = parseCodexWindow(limits[key]), w.span > 0 else { continue }
-            let name = windowLabel(w.span)
-            metrics.append(Metric(id: "codex.\(slug(name))", provider: .codex, name: name,
-                                  pct: w.pct, resets: w.resets))
+        // Codex meters several buckets and its own UI shows all of them: the plan's
+        // own window (limitId "codex"), one per metered model, and code review. Verified
+        // against the client's `account/rateLimits/read` RPC — on Pro the plan bucket has
+        // only a 7-day window, and the sole 5h clock belongs to a model bucket. So we
+        // show one row per window length, and tag any row that isn't the plan's own with
+        // the bucket it came from, the way Codex labels it.
+        var rows: [Double: (pct: Double, resets: Date?, detail: String?)] = [:]
+
+        func addAccount(_ w: (pct: Double, span: Double, resets: Date?)?) {
+            guard let w = w, w.span > 0 else { return }
+            rows[w.span] = (w.pct, w.resets, nil)      // the plan's own window always wins
         }
-        metrics.sort { $0.resets ?? .distantFuture < $1.resets ?? .distantFuture }
+        func addBucket(_ name: String, _ w: (pct: Double, span: Double, resets: Date?)?) {
+            guard let w = w, w.span > 0 else { return }
+            if let cur = rows[w.span] {
+                if cur.detail == nil { return }        // never shadow the plan's own window
+                if cur.pct >= w.pct { return }         // otherwise the most-consumed wins
+            }
+            rows[w.span] = (w.pct, w.resets, name)
+        }
+
+        let limits = (root["rate_limit"] as? [String: Any]) ?? [:]
+        addAccount(parseCodexWindow(limits["primary_window"]))
+        addAccount(parseCodexWindow(limits["secondary_window"]))
+
+        for entry in (root["additional_rate_limits"] as? [[String: Any]]) ?? [] {
+            let name = (entry["limit_name"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "model"
+            let rl = (entry["rate_limit"] as? [String: Any]) ?? [:]
+            addBucket(name, parseCodexWindow(rl["primary_window"]))
+            addBucket(name, parseCodexWindow(rl["secondary_window"]))
+        }
+        if let cr = root["code_review_rate_limit"] as? [String: Any] {
+            let rl = (cr["rate_limit"] as? [String: Any]) ?? cr
+            addBucket("code review", parseCodexWindow(rl["primary_window"]))
+            addBucket("code review", parseCodexWindow(rl["secondary_window"]))
+        }
+
+        // Shortest window first — a 5h cap is the one you can act on today. The id comes
+        // from the window name, so a pinned row survives a change in which bucket wins.
+        let metrics = rows.keys.sorted().map { span -> Metric in
+            let name = windowLabel(span), r = rows[span]!
+            return Metric(id: "codex.\(slug(name))", provider: .codex, name: name,
+                          detail: r.detail, pct: r.pct, resets: r.resets)
+        }
 
         log("codex ok " + metrics.map { "\($0.name)=\(Int($0.pct))%" }.joined(separator: " "))
         completion(.ok(ProviderUsage(provider: .codex,

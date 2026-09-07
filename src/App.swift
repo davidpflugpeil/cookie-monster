@@ -356,7 +356,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             disabled(menu, msg, bold: false)
         case .ok(let u):
             let rows = u.metrics.map {
-                InfoCardView.Row(id: $0.id, name: $0.name, pct: $0.pct, resets: $0.resets)
+                InfoCardView.Row(id: $0.id, name: $0.name, detail: $0.detail,
+                                 pct: $0.pct, resets: $0.resets)
             }
             // claudeEmail arrives on its own request, so prefer the freshest value.
             let email = (p == .claude ? claudeEmail : nil) ?? u.email
@@ -396,7 +397,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if shown > 0 { sub.addItem(.separator()) }
             disabled(sub, "\(u.provider.label) \(u.plan)", bold: true)
             for m in u.metrics {
-                let it = NSMenuItem(title: "\(m.name) — \(String(format: "%.0f%%", m.pct))",
+                let qualifier = m.detail.map { " (\($0))" } ?? ""
+                let it = NSMenuItem(title: "\(m.name)\(qualifier) — \(String(format: "%.0f%%", m.pct))",
                                     action: #selector(setPinned(_:)), keyEquivalent: "")
                 it.target = self
                 it.representedObject = m.id
@@ -495,7 +497,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 // MARK: - Info card (custom-drawn dropdown section: plan, email, usage bars, updated)
 
 final class InfoCardView: NSView {
-    struct Row { let id: String; let name: String; let pct: Double; let resets: Date? }
+    struct Row { let id: String; let name: String; let detail: String?; let pct: Double; let resets: Date? }
 
     private let title: String
     private let email: String?
@@ -575,6 +577,10 @@ final class InfoCardView: NSView {
                 }
                 let name = t(r.name, .systemFont(ofSize: 13, weight: isPinned ? .semibold : .medium), .labelColor)
                 left(name, x, y)
+                if let d = r.detail {
+                    left(t(d, .systemFont(ofSize: 11, weight: .regular), .tertiaryLabelColor),
+                         x + name.size().width + 7, y + 2)
+                }
                 right(t(String(format: "%.0f%%", r.pct), .monospacedDigitSystemFont(ofSize: 13, weight: .bold), .labelColor), w - x, y)
             }
             y += nameH + gap

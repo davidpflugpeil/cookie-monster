@@ -4,6 +4,17 @@ All notable changes to Cookie Monster are documented here. The format is based o
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.4.2] — 2026-09-07
+
+### Fixed
+- **The Codex 5h row is back.** 0.4.1 removed it on the reasoning that a per-model
+  cap isn't the plan's budget. Verified against the Codex client's own
+  `account/rateLimits/read` RPC, that was wrong: Codex surfaces every bucket it
+  meters, and on Pro the plan bucket (`limitId: "codex"`) has only a 7-day window,
+  so the sole 5h clock legitimately belongs to a model bucket. Cookie Monster now
+  shows one row per window length again, tagging any row that isn't the plan's own
+  with the bucket it came from — matching what Codex itself displays.
+
 ## [0.4.1] — 2026-09-07
 
 ### Fixed

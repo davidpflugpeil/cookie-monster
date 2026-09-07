@@ -37,7 +37,8 @@ Updated 12s ago
 Codex Pro
 you@example.com
 ────────────────────────────────────────────
-Weekly           █░░░░░░░░░   1%  resets in 6d 20h
+5h  GPT-5.3-Codex-Spark  ░░░░░░░░░░   0%  resets in 4h 59m
+Weekly                   █░░░░░░░░░   2%  resets in 6d 20h
 ────────────────────────────────────────────
 Updated 12s ago
 
@@ -137,12 +138,11 @@ credentials are left untouched.
   (`five_hour` / `seven_day` / `seven_day_opus` / `seven_day_sonnet` for Claude,
   `rate_limit`, `additional_rate_limits` and `code_review_rate_limit` for Codex).
 - **Codex windows vary by plan.** On Pro, `rate_limit.secondary_window` is null
-  and the account-wide window is the *weekly* one, so you'll see a single Weekly
-  bar. Cookie Monster reads that block and
-  shows only the windows in the account-wide `rate_limit` block — your plan's own
-  budget. The per-model caps in `additional_rate_limits` are deliberately not
-  shown: they meter one specific model, so a 0% there says nothing about how much
-  of your subscription is left.
+  and the plan's own window is the *weekly* one — the only 5h clock belongs to a
+  per-model bucket and is tagged as such. Cookie Monster reads every block and
+  shows one row per window length, tagging any row that isn't your plan's own with
+  the bucket it came from. This mirrors Codex itself, which surfaces every bucket
+  it meters — the plan window, one per metered model, and code review.
 
 ## Repo layout
 
