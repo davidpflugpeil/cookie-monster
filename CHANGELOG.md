@@ -15,6 +15,10 @@ All notable changes to Cookie Monster are documented here. The format is based o
   untouched" when your plan has no 5-hour window at all. Only
   `rate_limit.primary_window` / `secondary_window` are read now, so a Pro account
   correctly shows a single `Weekly` bar and a Plus account shows `5h` + `Weekly`.
+- Pinned-row spacing. The highlight block had a hard-coded height that was 6pt
+  shorter than the row it wrapped, leaving 7pt of padding above the label and 1pt
+  below the reset line. Its geometry is now derived from the row's own metrics, so
+  the padding is symmetric, and the band sits evenly between the two hairlines.
 
 ## [0.4.0] — 2026-09-07
 

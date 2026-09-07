@@ -532,9 +532,10 @@ final class InfoCardView: NSView {
     private func right(_ s: NSAttributedString, _ rx: CGFloat, _ y: CGFloat) { s.draw(at: NSPoint(x: rx - s.size().width, y: y)) }
 
     /// A small "PINNED" pill marking the row that's showing in the menu bar.
+    private let resetHeight: CGFloat = 15
     private func pill(_ x: CGFloat, _ y: CGFloat) {
         let s = t("PINNED", .systemFont(ofSize: 9, weight: .bold), .controlAccentColor)
-        let r = NSRect(x: x, y: y, width: s.size().width + 12, height: 15)
+        let r = NSRect(x: x, y: y, width: s.size().width + 12, height: resetHeight)
         NSColor.controlAccentColor.withAlphaComponent(0.15).setFill()
         NSBezierPath(roundedRect: r, xRadius: 7.5, yRadius: 7.5).fill()
         s.draw(at: NSPoint(x: x + 6, y: y + 3))
@@ -555,10 +556,17 @@ final class InfoCardView: NSView {
         }
         y += 10
         if paint { NSColor.quaternaryLabelColor.setFill(); NSRect(x: x, y: y, width: cw, height: 1).fill() }
-        y += 13
+        y += 15
+        // Row geometry. The pinned row's tint wraps the whole row, so the block has to
+        // be derived from the same numbers the content uses — hard-coding its height is
+        // how it ended up with 7pt above the label and 1pt below the reset line.
+        let nameH: CGFloat = 16, barH: CGFloat = 8, resetH = resetHeight
+        let gap: CGFloat = 9, pad: CGFloat = 7
+        let rowH = nameH + gap + barH + gap + resetH
+
         for (i, r) in rows.enumerated() {
             let isPinned = (r.id == pinnedID)
-            let block = NSRect(x: x - 8, y: y - 7, width: cw + 16, height: 65)
+            let block = NSRect(x: x - 8, y: y - pad, width: cw + 16, height: rowH + pad * 2)
             hitRects.append((block, r.id))
             if paint {
                 if isPinned {
@@ -569,24 +577,24 @@ final class InfoCardView: NSView {
                 left(name, x, y)
                 right(t(String(format: "%.0f%%", r.pct), .monospacedDigitSystemFont(ofSize: 13, weight: .bold), .labelColor), w - x, y)
             }
-            y += 25
+            y += nameH + gap
             if paint {
-                let bh: CGFloat = 8
+                let bh = barH
                 NSColor.quaternaryLabelColor.setFill()
                 NSBezierPath(roundedRect: NSRect(x: x, y: y, width: cw, height: bh), xRadius: bh/2, yRadius: bh/2).fill()
                 let fw = max(bh, cw * CGFloat(min(100, max(0, r.pct)) / 100))
                 severityColor(r.pct).setFill()
                 NSBezierPath(roundedRect: NSRect(x: x, y: y, width: fw, height: bh), xRadius: bh/2, yRadius: bh/2).fill()
             }
-            y += 17
+            y += barH + gap
             if paint {
-                if isPinned { pill(x, y - 1) }
+                if isPinned { pill(x, y) }
                 right(t("resets in \(countdown(to: r.resets))", .systemFont(ofSize: 12, weight: .medium), .secondaryLabelColor), w - x, y)
             }
-            y += 16
+            y += resetH
             if i < rows.count - 1 { y += 16 }
         }
-        y += 12
+        y += pad + 7
         if paint { NSColor.quaternaryLabelColor.setFill(); NSRect(x: x, y: y, width: cw, height: 1).fill() }
         y += 13
         if paint { left(t("Updated \(ago(fetchedAt))", .systemFont(ofSize: 12, weight: .regular), .secondaryLabelColor), x, y) }
