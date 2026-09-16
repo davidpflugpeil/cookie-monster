@@ -4,6 +4,28 @@ All notable changes to Cookie Monster are documented here. The format is based o
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.4.4] — 2026-09-16
+
+### Fixed
+- **Constant `429 Rate limited` from the Claude endpoint.** The usage API answers a
+  429 with `Retry-After` — typically ~1 hour — and Cookie Monster ignored it,
+  re-polling on its normal interval and burning the next quota window the moment it
+  reset. Lowering the poll interval made this *worse*, not better. On two days in a
+  row the app got 1,440 rejections and zero successful reads.
+  - `Retry-After` is now honoured (seconds or HTTP-date), plus 5–60s of jitter so
+    installs don't stampede the same reset.
+  - Transient errors back off geometrically, capped at 30 minutes.
+  - The account email is fetched **once** instead of on every poll — that alone
+    halved the request rate against the rate-limited endpoint.
+  - Default poll interval is now 5 minutes, and the 30-second option is gone.
+- **A rate limit no longer blanks the dropdown.** The last good reading stays on
+  screen (the numbers can't have moved while we're locked out) with an orange
+  `rate limited · 50m` note counting down to the retry, and the menu-bar item keeps
+  showing the pinned window instead of jumping to the other subscription.
+- Non-2xx responses now log their rate-limit headers and body, so this is
+  diagnosable from `~/.cookie-monster/cookie-monster.log` instead of being an
+  opaque status code.
+
 ## [0.4.3] — 2026-09-07
 
 ### Changed

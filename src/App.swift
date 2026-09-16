@@ -96,6 +96,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var liveRefreshers: [() -> Void] = []    // updates time-sensitive rows in place
     var states: [Provider: FetchState] = [:]
     var claudeEmail: String?                 // signed-in Claude account email
+    var lastGood: [Provider: ProviderUsage] = [:]   // survives a 429 so the card stays useful
+    var nextAllowed: [Provider: Date] = [:]         // earliest next call, per provider
+    var failures: [Provider: Int] = [:]             // consecutive failures → backoff
     var menuIsOpen = false                   // drives the in-place rebuild in render()
 
     /// A monochrome gauge drawn as a template image (so macOS tints it to the menu
@@ -120,9 +123,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return img
     }
 
+    // No sub-minute option: these endpoints hand out hour-long rate-limit windows, and
+    // a 60s poll is what got this app blocked for days.
     let intervalChoices: [(label: String, secs: TimeInterval)] = [
-        ("30 seconds", 30), ("1 minute", 60), ("2 minutes", 120),
-        ("5 minutes", 300), ("15 minutes", 900),
+        ("1 minute", 60), ("2 minutes", 120), ("5 minutes", 300),
+        ("15 minutes", 900), ("30 minutes", 1800),
     ]
 
     func applicationDidFinishLaunching(_ note: Notification) {
@@ -164,6 +169,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refreshCodex()
     }
 
+    /// True while a provider is inside a Retry-After / backoff window. Calling anyway is
+    /// what keeps a rolling rate-limit window pinned open, so every path respects it.
+    func isBlocked(_ p: Provider) -> Bool {
+        guard let until = nextAllowed[p] else { return false }
+        if Date() >= until { nextAllowed[p] = nil; return false }
+        return true
+    }
+
     private func refreshClaude() {
         let found = readCredentials()
         guard claudeInstalled() || found != nil else {
@@ -174,9 +187,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             log("claude: no credentials in keychain")
             set(.claude, .needsAuth); return
         }
-        fetchAccountEmail(creds: creds) { [weak self] email in
-            guard let email = email else { return }   // keep the last good value on failure
-            DispatchQueue.main.async { self?.claudeEmail = email; self?.render() }
+        guard !isBlocked(.claude) else { return }
+
+        // The account email never changes between sign-ins, so fetch it once rather than
+        // doubling our request count against a rate-limited endpoint on every poll.
+        if claudeEmail == nil {
+            fetchAccountEmail(creds: creds) { [weak self] email in
+                guard let email = email else { return }
+                DispatchQueue.main.async { self?.claudeEmail = email; self?.render() }
+            }
         }
         fetchClaudeUsage(creds: creds, email: claudeEmail) { [weak self] result in
             self?.set(.claude, result)
@@ -190,6 +209,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             log("codex: no token in ~/.codex/auth.json")
             set(.codex, .needsAuth); return
         }
+        guard !isBlocked(.codex) else { return }
         fetchCodexUsage(creds: creds) { [weak self] result in
             self?.set(.codex, result)
         }
@@ -197,6 +217,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func set(_ p: Provider, _ s: FetchState) {
         DispatchQueue.main.async {
+            switch s {
+            case .ok(let u):
+                self.lastGood[p] = u
+                self.failures[p] = 0
+                self.nextAllowed[p] = nil
+            case .rateLimited(let until):
+                // Spread the retry so every install doesn't stampede the same second.
+                self.nextAllowed[p] = until.addingTimeInterval(Double.random(in: 5...60))
+                self.failures[p] = 0
+            case .error:
+                // Back off geometrically on transient failures, capped at 30 minutes.
+                let n = (self.failures[p] ?? 0) + 1
+                self.failures[p] = n
+                let wait = min(Prefs.interval * pow(2, Double(min(n, 5))), 1800)
+                self.nextAllowed[p] = Date().addingTimeInterval(wait)
+                log("\(p.rawValue) error #\(n) → retry in \(Int(wait))s")
+            case .needsAuth, .notConfigured, .loading:
+                self.nextAllowed[p] = nil
+            }
             self.states[p] = s
             self.reconcilePin(p)
             self.render()
@@ -233,15 +272,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    /// The window currently shown in the menu bar, falling back to the first available.
+    /// The window shown in the menu bar. Resolution order matters: a provider that is
+    /// rate limited has no live metrics, and jumping to the *other* subscription's number
+    /// would be worse than showing the pinned one's last known value.
     var pinnedMetric: Metric? {
-        let all = allMetrics
-        if let m = all.first(where: { $0.id == Prefs.pinnedID }) { return m }
-        // Metric ids can change between versions. Keep the user on the provider they
-        // pinned rather than silently jumping to a different subscription.
-        let provider = Prefs.pinnedID.split(separator: ".").first.map(String.init) ?? ""
-        if let p = Provider(rawValue: provider), let m = all.first(where: { $0.provider == p }) { return m }
-        return all.first
+        let live = allMetrics
+        let cached = Provider.allCases.compactMap { lastGood[$0] }.flatMap { $0.metrics }
+        let id = Prefs.pinnedID
+        if let m = live.first(where: { $0.id == id }) { return m }
+        if let m = cached.first(where: { $0.id == id }) { return m }
+        // Ids can change between versions — stay on the pinned provider before falling
+        // back across subscriptions.
+        if let p = Provider(rawValue: id.split(separator: ".").first.map(String.init) ?? "") {
+            if let m = live.first(where: { $0.provider == p }) { return m }
+            if let m = cached.first(where: { $0.provider == p }) { return m }
+        }
+        return live.first ?? cached.first
     }
 
     // MARK: UI
@@ -367,28 +413,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case .needsAuth:
             disabled(menu, "\(p.label) — not signed in", bold: true)
             disabled(menu, p.signInHint, bold: false)
+        case .rateLimited(let until):
+            // The numbers can't have moved while we're locked out, so the last good card
+            // is still the best answer — just say when we'll try again.
+            if let u = lastGood[p] {
+                addCard(menu, p, u) { [weak self] in
+                    guard let t = self?.nextAllowed[p] ?? until as Date? else { return nil }
+                    return "rate limited · \(countdown(to: t))"
+                }
+            } else {
+                disabled(menu, "\(p.label) — rate limited", bold: true)
+                disabled(menu, "retrying in \(countdown(to: until))", bold: false)
+            }
         case .error(let msg):
-            disabled(menu, "\(p.label) — couldn't reach usage API", bold: true)
-            disabled(menu, msg, bold: false)
+            if let u = lastGood[p] {
+                addCard(menu, p, u) { "couldn't refresh" }
+            } else {
+                disabled(menu, "\(p.label) — couldn't reach usage API", bold: true)
+                disabled(menu, msg, bold: false)
+            }
         case .ok(let u):
-            let rows = u.metrics.map {
-                InfoCardView.Row(id: $0.id, name: $0.name, pct: $0.pct, resets: $0.resets)
-            }
-            // claudeEmail arrives on its own request, so prefer the freshest value.
-            let email = (p == .claude ? claudeEmail : nil) ?? u.email
-            let card = InfoCardView(title: "\(u.provider.label) \(u.plan)",
-                                    email: email,
-                                    rows: rows,
-                                    fetchedAt: u.fetchedAt,
-                                    pinnedID: pinnedMetric?.id) { [weak self] id in
-                self?.pick(id)
-            }
-            let cardItem = NSMenuItem()
-            cardItem.isEnabled = true
-            cardItem.view = card
-            liveRefreshers.append { [weak card] in card?.refresh() }
-            menu.addItem(cardItem)
+            addCard(menu, p, u)
         }
+    }
+
+    private func addCard(_ menu: NSMenu, _ p: Provider, _ u: ProviderUsage,
+                         note: @escaping () -> String? = { nil }) {
+        let rows = u.metrics.map {
+            InfoCardView.Row(id: $0.id, name: $0.name, pct: $0.pct, resets: $0.resets)
+        }
+        // claudeEmail arrives on its own request, so prefer the freshest value.
+        let email = (p == .claude ? claudeEmail : nil) ?? u.email
+        let card = InfoCardView(title: "\(u.provider.label) \(u.plan)",
+                                email: email,
+                                rows: rows,
+                                fetchedAt: u.fetchedAt,
+                                note: note,
+                                pinnedID: pinnedMetric?.id) { [weak self] id in
+            self?.pick(id)
+        }
+        let cardItem = NSMenuItem()
+        cardItem.isEnabled = true
+        cardItem.view = card
+        liveRefreshers.append { [weak card] in card?.refresh() }
+        menu.addItem(cardItem)
     }
 
     private func disabled(_ menu: NSMenu, _ s: String, bold: Bool) {
@@ -515,6 +583,7 @@ final class InfoCardView: NSView {
 
     private let title: String
     private let email: String?
+    private let note: () -> String?
     private let rows: [Row]
     private let fetchedAt: Date
     private let pinnedID: String?
@@ -522,9 +591,9 @@ final class InfoCardView: NSView {
     /// Filled during layout so a click can find the row underneath it.
     private var hitRects: [(rect: NSRect, id: String)] = []
 
-    init(title: String, email: String?, rows: [Row], fetchedAt: Date,
+    init(title: String, email: String?, rows: [Row], fetchedAt: Date, note: @escaping () -> String? = { nil },
          pinnedID: String?, onPick: @escaping (String) -> Void) {
-        self.title = title; self.email = email; self.rows = rows
+        self.title = title; self.email = email; self.rows = rows; self.note = note
         self.fetchedAt = fetchedAt; self.pinnedID = pinnedID; self.onPick = onPick
         super.init(frame: NSRect(x: 0, y: 0, width: 300, height: 10))
         setFrameSize(NSSize(width: 300, height: layout(false)))   // exact fit to content
@@ -613,7 +682,12 @@ final class InfoCardView: NSView {
         y += pad + 7
         if paint { NSColor.quaternaryLabelColor.setFill(); NSRect(x: x, y: y, width: cw, height: 1).fill() }
         y += 13
-        if paint { left(t("Updated \(ago(fetchedAt))", .systemFont(ofSize: 12, weight: .regular), .secondaryLabelColor), x, y) }
+        if paint {
+            left(t("Updated \(ago(fetchedAt))", .systemFont(ofSize: 12, weight: .regular), .secondaryLabelColor), x, y)
+            if let note = note() {
+                right(t(note, .systemFont(ofSize: 12, weight: .medium), .systemOrange), w - x, y)
+            }
+        }
         y += 16 + 13
         return y
     }

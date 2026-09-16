@@ -107,8 +107,9 @@ All three are in the 🍪 menu and persist across restarts:
   window from every signed-in subscription is listed, grouped by provider
   (Claude **Session** / **Week** / **Week (model)**, Codex **5h** / **Weekly**).
   You can also just **click a row in the dropdown** to pin it.
-- **Update Every** — how often it polls: 30 seconds, 1 / 2 / 5 / 15 minutes
-  (default 1 minute).
+- **Update Every** — how often it polls: 1 / 2 / 5 / 15 / 30 minutes (default 5
+  minutes). Both usage endpoints are rate limited on roughly an hourly quota, so
+  polling faster gets you blocked rather than fresher numbers.
 - **Menu Bar Style** — **Default** (a monochrome gauge whose needle tracks your
   usage, in the native menu-bar text color) or **Vibrant** (the 🍪 emoji with a
   green/orange/red percentage).
@@ -128,6 +129,10 @@ credentials are left untouched.
   (Pro / Max / Team) and/or a ChatGPT subscription signed into the Codex CLI
   (Plus / Pro / Business). It reports whatever accounts those CLIs are
   authenticated as.
+- **Rate limits.** Both endpoints return `429` with a `Retry-After` of up to an
+  hour if you poll too often. Cookie Monster honours it, keeps showing the last
+  good reading with a `rate limited · <countdown>` note, and retries once the
+  window clears — so there is nothing to do but wait.
 - **Token refresh:** if a section shows *not signed in*, that provider's OAuth
   token expired — run `claude` or `codex` once to refresh it, then click
   **Refresh Now**. Cookie Monster intentionally does not refresh tokens itself,

@@ -12,10 +12,10 @@ let kCodexUsageURL = URL(string: "https://chatgpt.com/backend-api/codex/usage")!
 let kCodexDir = (NSHomeDirectory() as NSString).appendingPathComponent(".codex")
 let kCodexAuthPath = (kCodexDir as NSString).appendingPathComponent("auth.json")
 let kLoginPlistLabel = "com.pflugpeil.cookiemonster"
-let kPollInterval: TimeInterval = 60
+let kPollInterval: TimeInterval = 300
 let kLogDir = (NSHomeDirectory() as NSString).appendingPathComponent(".cookie-monster")
 let kLogFile = (kLogDir as NSString).appendingPathComponent("cookie-monster.log")
-let kVersion = "0.4.3"
+let kVersion = "0.4.4"
 
 // MARK: - Logging (no secrets ever pass through here)
 
@@ -79,6 +79,7 @@ enum FetchState {
     case loading
     case ok(ProviderUsage)
     case needsAuth          // installed but no token, or 401/403
+    case rateLimited(Date)  // 429 — do not call again before this date
     case error(String)
 }
 
@@ -248,6 +249,47 @@ func windowLabel(_ seconds: Double) -> String {
     }
 }
 
+/// How long the server asked us to wait. `Retry-After` is seconds or an HTTP date.
+func retryAfter(_ http: HTTPURLResponse) -> TimeInterval? {
+    guard let raw = (http.value(forHTTPHeaderField: "Retry-After") ??
+                     http.value(forHTTPHeaderField: "retry-after"))?
+        .trimmingCharacters(in: .whitespaces), !raw.isEmpty else { return nil }
+    if let secs = TimeInterval(raw) { return max(0, secs) }
+    let f = DateFormatter()
+    f.locale = Locale(identifier: "en_US_POSIX")
+    f.timeZone = TimeZone(identifier: "GMT")
+    f.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
+    if let d = f.date(from: raw) { return max(0, d.timeIntervalSinceNow) }
+    return nil
+}
+
+/// Surfaces whatever the server says about *why* it refused, so a 429 is debuggable
+/// from the log instead of being an opaque status code.
+func rateLimitDiagnostics(_ http: HTTPURLResponse, _ data: Data?) -> String {
+    var bits: [String] = []
+    for (k, v) in http.allHeaderFields {
+        let key = "\(k)".lowercased()
+        guard key.contains("ratelimit") || key == "retry-after" || key == "x-should-retry"
+                || key.contains("request-id") else { continue }
+        bits.append("\(key)=\(v)")
+    }
+    if let data = data, !data.isEmpty,
+       let body = String(data: data.prefix(200), encoding: .utf8)?
+        .trimmingCharacters(in: .whitespacesAndNewlines), !body.isEmpty {
+        bits.append("body=\(body.replacingOccurrences(of: "\n", with: " "))")
+    }
+    return bits.isEmpty ? "" : " [" + bits.sorted().joined(separator: " ") + "]"
+}
+
+/// A 429 answer both providers share: honour Retry-After, and fall back to an hour —
+/// these endpoints hand out windows on that scale, and retrying sooner just keeps the
+/// rolling window pinned open.
+func rateLimitedState(_ http: HTTPURLResponse, _ data: Data?, _ who: String) -> FetchState {
+    let wait = retryAfter(http) ?? 3600
+    log("\(who) fetch http 429 → backing off \(Int(wait))s\(rateLimitDiagnostics(http, data))")
+    return .rateLimited(Date().addingTimeInterval(wait))
+}
+
 // MARK: - Claude fetch
 
 func fetchClaudeUsage(creds: Credentials, email: String?, completion: @escaping (FetchState) -> Void) {
@@ -269,9 +311,10 @@ func fetchClaudeUsage(creds: Credentials, email: String?, completion: @escaping 
             log("claude fetch http \(http.statusCode) → needs auth")
             completion(.needsAuth); return
         }
+        if http.statusCode == 429 { completion(rateLimitedState(http, data, "claude")); return }
         guard http.statusCode == 200, let data = data,
               let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            log("claude fetch http \(http.statusCode)")
+            log("claude fetch http \(http.statusCode)\(rateLimitDiagnostics(http, data))")
             completion(.error("HTTP \(http.statusCode)")); return
         }
 
@@ -340,9 +383,10 @@ func fetchCodexUsage(creds: CodexCredentials, completion: @escaping (FetchState)
             log("codex fetch http \(http.statusCode) → needs auth")
             completion(.needsAuth); return
         }
+        if http.statusCode == 429 { completion(rateLimitedState(http, data, "codex")); return }
         guard http.statusCode == 200, let data = data,
               let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            log("codex fetch http \(http.statusCode)")
+            log("codex fetch http \(http.statusCode)\(rateLimitDiagnostics(http, data))")
             completion(.error("HTTP \(http.statusCode)")); return
         }
 
