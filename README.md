@@ -80,7 +80,9 @@ cd cookie-monster
 ## How it works
 
 **Claude** — reads your existing **Claude Code OAuth token** from the login
-keychain (`Claude Code-credentials`) and polls the (undocumented)
+keychain (`Claude Code-credentials`), takes the signed-in account from
+`oauthAccount` in `~/.claude.json` (so switching accounts is picked up without an
+extra API call), and polls the (undocumented)
 `https://api.anthropic.com/api/oauth/usage` endpoint, the same one that powers
 `/usage` inside Claude Code, with a `claude-code/<ver>` User-Agent and the
 `anthropic-beta: oauth-2025-04-20` header.

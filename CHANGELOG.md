@@ -4,6 +4,22 @@ All notable changes to Cookie Monster are documented here. The format is based o
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.4.5] — 2026-09-18
+
+### Fixed
+- **The account email didn't update when you switched Claude accounts.** 0.4.4
+  stopped re-fetching it on every poll (to cut the request rate that was causing
+  429s) but had no way to notice a switch, so the old address stuck until you
+  quit the app. The email is now read from `oauthAccount` in `~/.claude.json`,
+  which Claude Code rewrites on sign-in — so a switch shows up on the next poll,
+  and the `/oauth/account` request is gone entirely, taking more pressure off the
+  rate-limited endpoint. (The network call remains as a one-time fallback for
+  older Claude Code versions that don't write that key.)
+- Switching accounts now clears the previous account's cached reading and any
+  rate-limit backoff, since the new account has its own numbers and its own quota
+  — you no longer sit out the old account's lockout.
+- Signing out clears the remembered account, so signing back in re-detects it.
+
 ## [0.4.4] — 2026-09-16
 
 ### Fixed

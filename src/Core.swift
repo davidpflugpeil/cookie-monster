@@ -8,6 +8,7 @@ import Foundation
 let kUsageURL = URL(string: "https://api.anthropic.com/api/oauth/usage")!
 let kAccountURL = URL(string: "https://api.anthropic.com/api/oauth/account")!
 let kKeychainService = "Claude Code-credentials"
+let kClaudeConfigPath = (NSHomeDirectory() as NSString).appendingPathComponent(".claude.json")
 let kCodexUsageURL = URL(string: "https://chatgpt.com/backend-api/codex/usage")!
 let kCodexDir = (NSHomeDirectory() as NSString).appendingPathComponent(".codex")
 let kCodexAuthPath = (kCodexDir as NSString).appendingPathComponent("auth.json")
@@ -15,7 +16,7 @@ let kLoginPlistLabel = "com.pflugpeil.cookiemonster"
 let kPollInterval: TimeInterval = 300
 let kLogDir = (NSHomeDirectory() as NSString).appendingPathComponent(".cookie-monster")
 let kLogFile = (kLogDir as NSString).appendingPathComponent("cookie-monster.log")
-let kVersion = "0.4.4"
+let kVersion = "0.4.5"
 
 // MARK: - Logging (no secrets ever pass through here)
 
@@ -172,6 +173,19 @@ func readCredentials() -> Credentials? {
         return Credentials(accessToken: String(blob[r]), plan: nil, expiresAt: nil)
     }
     return nil
+}
+
+/// Claude Code records the signed-in account in ~/.claude.json and rewrites it when you
+/// switch accounts, so the email can be read straight off disk. That reflects a switch
+/// immediately *and* saves a call to /oauth/account, which shares the rate limit that the
+/// usage endpoint hands out 429s on.
+/// The `path` parameter exists so tests can point at a fixture.
+func readClaudeAccount(path: String = kClaudeConfigPath) -> (email: String, uuid: String?)? {
+    guard let data = FileManager.default.contents(atPath: path),
+          let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let acct = root["oauthAccount"] as? [String: Any],
+          let email = acct["emailAddress"] as? String, !email.isEmpty else { return nil }
+    return (email, acct["accountUuid"] as? String)
 }
 
 /// True when Claude Code is present on this Mac (so we know whether to show the section).

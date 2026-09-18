@@ -96,6 +96,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var liveRefreshers: [() -> Void] = []    // updates time-sensitive rows in place
     var states: [Provider: FetchState] = [:]
     var claudeEmail: String?                 // signed-in Claude account email
+    var claudeAccountKey: String?            // identifies the account, to detect a switch
     var lastGood: [Provider: ProviderUsage] = [:]   // survives a 429 so the card stays useful
     var nextAllowed: [Provider: Date] = [:]         // earliest next call, per provider
     var failures: [Provider: Int] = [:]             // consecutive failures → backoff
@@ -185,21 +186,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if states[.claude] == nil { states[.claude] = .loading }
         guard let creds = found else {
             log("claude: no credentials in keychain")
+            claudeEmail = nil; claudeAccountKey = nil
             set(.claude, .needsAuth); return
         }
-        guard !isBlocked(.claude) else { return }
-
-        // The account email never changes between sign-ins, so fetch it once rather than
-        // doubling our request count against a rate-limited endpoint on every poll.
-        if claudeEmail == nil {
+        // Read the signed-in account off disk every poll — it's a local file, so a switch
+        // shows up immediately without spending a request on /oauth/account.
+        if let acct = readClaudeAccount() {
+            let key = acct.uuid ?? acct.email
+            if claudeAccountKey != nil && claudeAccountKey != key {
+                accountSwitched(to: acct.email)
+            }
+            claudeAccountKey = key
+            claudeEmail = acct.email
+        } else if claudeEmail == nil {
+            // Older Claude Code versions don't write oauthAccount — fall back to the
+            // network once, and only once, so we stay off the rate-limited endpoint.
             fetchAccountEmail(creds: creds) { [weak self] email in
                 guard let email = email else { return }
                 DispatchQueue.main.async { self?.claudeEmail = email; self?.render() }
             }
         }
+
+        guard !isBlocked(.claude) else { return }
         fetchClaudeUsage(creds: creds, email: claudeEmail) { [weak self] result in
             self?.set(.claude, result)
         }
+    }
+
+    /// A different account means different numbers and a fresh rate-limit budget, so drop
+    /// the previous account's cached reading and any backoff we were sitting out.
+    private func accountSwitched(to email: String) {
+        log("claude account switched → \(email); clearing cache + backoff")
+        lastGood[.claude] = nil
+        failures[.claude] = 0
+        nextAllowed[.claude] = nil
+        states[.claude] = .loading
     }
 
     private func refreshCodex() {
