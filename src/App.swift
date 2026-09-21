@@ -95,8 +95,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var menuTimer: Timer?                    // ticks while the menu is open
     var liveRefreshers: [() -> Void] = []    // updates time-sensitive rows in place
     var states: [Provider: FetchState] = [:]
-    var claudeEmail: String?                 // signed-in Claude account email
-    var claudeAccountKey: String?            // identifies the account, to detect a switch
+    var claudeEmail: String?                 // email of the account behind claudeEmailToken
+    var claudeEmailToken: String?            // the access token claudeEmail was resolved from (memory only)
+    var claudeEmailInFlight = false          // one /oauth/account lookup at a time
     var lastGood: [Provider: ProviderUsage] = [:]   // survives a 429 so the card stays useful
     var nextAllowed: [Provider: Date] = [:]         // earliest next call, per provider
     var failures: [Provider: Int] = [:]             // consecutive failures → backoff
@@ -186,30 +187,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if states[.claude] == nil { states[.claude] = .loading }
         guard let creds = found else {
             log("claude: no credentials in keychain")
-            claudeEmail = nil; claudeAccountKey = nil
+            claudeEmail = nil; claudeEmailToken = nil
             set(.claude, .needsAuth); return
         }
-        // Read the signed-in account off disk every poll — it's a local file, so a switch
-        // shows up immediately without spending a request on /oauth/account.
-        if let acct = readClaudeAccount() {
-            let key = acct.uuid ?? acct.email
-            if claudeAccountKey != nil && claudeAccountKey != key {
-                accountSwitched(to: acct.email)
-            }
-            claudeAccountKey = key
-            claudeEmail = acct.email
-        } else if claudeEmail == nil {
-            // Older Claude Code versions don't write oauthAccount — fall back to the
-            // network once, and only once, so we stay off the rate-limited endpoint.
-            fetchAccountEmail(creds: creds) { [weak self] email in
-                guard let email = email else { return }
-                DispatchQueue.main.async { self?.claudeEmail = email; self?.render() }
-            }
+        // The email has to come from the *same token* that produces the numbers. Claude
+        // Code keeps a credential store per config/session, and ~/.claude.json can name a
+        // different account than the keychain token we poll with — so reading the email
+        // from there labelled one account's usage with another account's address.
+        // Resolve it from the token instead, once per token: that's one request per
+        // sign-in or token refresh rather than per poll, so it doesn't bring back the 429s.
+        if creds.accessToken != claudeEmailToken && !claudeEmailInFlight {
+            resolveClaudeEmail(creds)
         }
 
         guard !isBlocked(.claude) else { return }
         fetchClaudeUsage(creds: creds, email: claudeEmail) { [weak self] result in
             self?.set(.claude, result)
+        }
+    }
+
+    private func resolveClaudeEmail(_ creds: Credentials) {
+        claudeEmailInFlight = true
+        let token = creds.accessToken
+        fetchAccountEmail(creds: creds) { [weak self] email in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.claudeEmailInFlight = false
+                guard let email = email else {
+                    // Leave claudeEmailToken unset so the next poll retries. Don't fall back
+                    // to ~/.claude.json: it's the source that was showing the wrong account.
+                    log("claude: couldn't resolve account for current token; will retry")
+                    return
+                }
+                let onDisk = readClaudeAccount()?.email
+                log("claude token → \(email)" + (onDisk != nil && onDisk != email
+                    ? " (~/.claude.json says \(onDisk!) — ignoring)" : ""))
+                if let previous = self.claudeEmail, previous != email {
+                    self.accountSwitched(to: email)
+                }
+                self.claudeEmail = email
+                self.claudeEmailToken = token
+                self.render()
+            }
         }
     }
 

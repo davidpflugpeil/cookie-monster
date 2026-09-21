@@ -16,7 +16,7 @@ let kLoginPlistLabel = "com.pflugpeil.cookiemonster"
 let kPollInterval: TimeInterval = 300
 let kLogDir = (NSHomeDirectory() as NSString).appendingPathComponent(".cookie-monster")
 let kLogFile = (kLogDir as NSString).appendingPathComponent("cookie-monster.log")
-let kVersion = "0.4.5"
+let kVersion = "0.4.6"
 
 // MARK: - Logging (no secrets ever pass through here)
 
@@ -175,10 +175,11 @@ func readCredentials() -> Credentials? {
     return nil
 }
 
-/// Claude Code records the signed-in account in ~/.claude.json and rewrites it when you
-/// switch accounts, so the email can be read straight off disk. That reflects a switch
-/// immediately *and* saves a call to /oauth/account, which shares the rate limit that the
-/// usage endpoint hands out 429s on.
+/// The account Claude Code's *config* file names — used only as a diagnostic, never as
+/// the displayed email. Claude Code keeps a credential store per config/session, so this
+/// can name a different account than the keychain token we actually poll with (seen in
+/// practice: the token belonged to one address while this said another). The email shown
+/// is always resolved from the token itself; see AppDelegate.resolveClaudeEmail.
 /// The `path` parameter exists so tests can point at a fixture.
 func readClaudeAccount(path: String = kClaudeConfigPath) -> (email: String, uuid: String?)? {
     guard let data = FileManager.default.contents(atPath: path),

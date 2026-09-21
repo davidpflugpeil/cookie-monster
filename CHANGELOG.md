@@ -4,6 +4,20 @@ All notable changes to Cookie Monster are documented here. The format is based o
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.4.6] — 2026-09-21
+
+### Fixed
+- **The Claude card could show one account's usage under another account's email.**
+  0.4.5 read the email from `oauthAccount` in `~/.claude.json` while reading the
+  numbers from the keychain token — two independent sources. Claude Code keeps a
+  credential store per config/session (this Mac had ~100), so they can disagree;
+  here the token belonged to one address while the config file named another, and
+  the menu paired them. The email is now resolved from the same token that
+  produces the numbers, via `/oauth/account`, once per token — a sign-in or token
+  refresh triggers one lookup, ordinary polls trigger none, so this doesn't bring
+  back the 429s. If the lookup fails the email is retried next poll rather than
+  falling back to the config file.
+
 ## [0.4.5] — 2026-09-18
 
 ### Fixed
