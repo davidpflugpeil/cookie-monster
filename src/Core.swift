@@ -17,7 +17,7 @@ let kLoginPlistLabel = "com.pflugpeil.cookiemonster"
 let kPollInterval: TimeInterval = 300
 let kLogDir = (cmHome() as NSString).appendingPathComponent(".cookie-monster")
 let kLogFile = (kLogDir as NSString).appendingPathComponent("cookie-monster.log")
-let kVersion = "0.4.6"
+let kVersion = "0.5.0"
 
 // MARK: - Logging (no secrets ever pass through here)
 

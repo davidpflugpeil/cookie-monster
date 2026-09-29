@@ -4,7 +4,7 @@ All notable changes to Cookie Monster are documented here. The format is based o
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased] — branch `profile-switch-v2`
+## [0.5.0] — 2026-09-29
 
 ### Added
 - **Codex gets the same treatment.** `CODEX_HOME` is Codex's equivalent of
