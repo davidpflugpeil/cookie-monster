@@ -4,6 +4,79 @@ All notable changes to Cookie Monster are documented here. The format is based o
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased] — branch `profile-switch-v2`
+
+### Added
+- **Codex gets the same treatment.** `CODEX_HOME` is Codex's equivalent of
+  `CLAUDE_CONFIG_DIR`, so a Codex profile works identically — and more simply:
+  Codex keeps credentials in a plain `auth.json` inside its config dir, so every
+  profile's usage is readable with no keychain lookup at all. Seeding copies
+  `config.toml` (where Codex's MCP servers live), `hooks.json`, `AGENTS.md`,
+  `prompts` and `skills`; `sessions` (1.4 GB here), `archived_sessions` and the
+  sqlite stores are never copied.
+- The shell setup now installs a function for **both** `claude` and `codex`, each
+  reading its own active-profile file, so the two switch independently.
+- **An account switcher at the top of each provider's card.** Every subscription is
+  listed with the value of your pinned metric for *that* account, the active one
+  marked; click a row to switch. Switching does not dismiss the menu, so you can
+  compare accounts in place. All profiles are polled, not just the active one, so the
+  numbers are live for each. Each account has its own rate-limit budget, and a 429
+  backs off per profile rather than for Claude as a whole.
+- **Switch between two Claude subscriptions without logging out.** Keep both signed
+  in and pick the active one from **Active Subscription** in the menu.
+  - A profile is a config directory under `~/.cookie-monster/profiles/` holding
+    **copies** of your settings and MCP servers. Claude Code keys its keychain entry
+    to the directory path, which is what lets both accounts stay signed in.
+  - **Copy Shell Setup** gives you a shell function for your rc file. It re-reads the
+    active subscription on every `claude` invocation, so switching applies to
+    terminals that are already open.
+  - Switching re-syncs settings and MCP servers from your default config into the
+    profile — one direction only, default → profile. Your own config is never
+    written to; every write is gated to `~/.cookie-monster/profiles`.
+  - `projects` (session history) is **not** copied: it is gigabytes, and each profile
+    keeps its own.
+
+### Known limitations
+- **Editor integrations that exec `claude` directly** don't read the shell function
+  and keep using your default subscription. The menu warns when the function isn't
+  installed at all.
+- Editor integrations aside, **usage now works for both subscriptions.** Claude Code
+  derives a profile's keychain entry name by an undocumented scheme we can't
+  reproduce — but we can *find* it: enumerating generic-password **attributes** is
+  silent (no `kSecReturnData`, nothing decrypted, no prompt), and the entry for a
+  profile is the one created when that profile was signed in. The candidate is then
+  **verified against `/oauth/account`** before use, so the app can never show one
+  subscription's usage under another's name, and the service name is recorded in the
+  profile so the search happens once. Costs a single keychain prompt per profile
+  ("Always Allow"); until it succeeds the card shows the profile's identity rather
+  than another account's numbers.
+
+### Note on the reverted v0.5.0
+An earlier attempt built profiles as **symlinks** to the real config. A profile that
+wasn't signed in yet caused Claude Code to initialise a fresh config, and that write
+replaced the symlink rather than following it — landing on the shared original and
+truncating `~/.claude.json` and `~/.claude/settings.json`. That version was reverted
+(`b41491f`); this one never symlinks anything, and `./run-tests.sh` asserts the
+originals are byte-identical against a throwaway home.
+
+### Hardened after a third review round
+- Copies now **dereference symlinks** (`cp -RL`). `FileManager.copyItem` preserves
+  them, so a `~/.claude/commands` symlinked into a dotfiles repo — or
+  `~/.claude/skills`, symlinked on the author's machine — put a link *inside* the
+  profile pointing out of the sandbox, which Claude Code then wrote through. A
+  post-seed sweep removes any symlink that slips in.
+- A profile's own `.claude.json` is **left untouched when it can't be parsed**,
+  instead of being replaced by an `mcpServers`-only file. Claude Code writes JSON
+  via Node, which emits unpaired surrogate escapes that `JSONSerialization`
+  rejects — so one emoji in that profile's history would otherwise have wiped it.
+- Switching no longer re-copies `settings.json`, `CLAUDE.md`, `commands`, `agents`
+  or `hooks`, which silently destroyed per-profile edits. Those are seeded once;
+  only `mcpServers` is pushed on switch.
+- The profile config is written `0600` (the source is `0600` and may carry MCP
+  credentials); profile directories are `0700`.
+- v0.5.0 symlink farms left on disk are neutralised at launch — they would still
+  write through into the real `~/.claude`.
+
 ## [0.4.6] — 2026-09-21
 
 ### Fixed

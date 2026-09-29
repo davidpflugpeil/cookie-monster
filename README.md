@@ -125,6 +125,10 @@ All three are in the 🍪 menu and persist across restarts:
 Removes the app, the login item, and the log directory. Your Claude and Codex
 credentials are left untouched.
 
+If you created subscription profiles, `~/.cookie-monster/profiles/` holds their
+copied settings — check it before removing the directory, and delete the
+`claude()` function from your shell rc.
+
 ## Limitations
 
 - **macOS 13+ only.** Needs a Claude subscription signed into Claude Code
