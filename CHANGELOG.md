@@ -36,9 +36,26 @@ An earlier attempt built profiles as **symlinks** to the real config. A profile 
 wasn't signed in yet caused Claude Code to initialise a fresh config, and that write
 replaced the symlink rather than following it — landing on the shared original and
 truncating `~/.claude.json` and `~/.claude/settings.json`. That version was reverted
-(`b41491f`); this one never symlinks anything, and the failing path is covered by a
-hermetic test that runs the real CLI under a signed-out profile and asserts the
-originals are byte-identical.
+(`b41491f`); this one never symlinks anything, and `./run-tests.sh` asserts the
+originals are byte-identical against a throwaway home.
+
+### Hardened after a third review round
+- Copies now **dereference symlinks** (`cp -RL`). `FileManager.copyItem` preserves
+  them, so a `~/.claude/commands` symlinked into a dotfiles repo — or
+  `~/.claude/skills`, symlinked on the author's machine — put a link *inside* the
+  profile pointing out of the sandbox, which Claude Code then wrote through. A
+  post-seed sweep removes any symlink that slips in.
+- A profile's own `.claude.json` is **left untouched when it can't be parsed**,
+  instead of being replaced by an `mcpServers`-only file. Claude Code writes JSON
+  via Node, which emits unpaired surrogate escapes that `JSONSerialization`
+  rejects — so one emoji in that profile's history would otherwise have wiped it.
+- Switching no longer re-copies `settings.json`, `CLAUDE.md`, `commands`, `agents`
+  or `hooks`, which silently destroyed per-profile edits. Those are seeded once;
+  only `mcpServers` is pushed on switch.
+- The profile config is written `0600` (the source is `0600` and may carry MCP
+  credentials); profile directories are `0700`.
+- v0.5.0 symlink farms left on disk are neutralised at launch — they would still
+  write through into the real `~/.claude`.
 
 ## [0.4.6] — 2026-09-21
 

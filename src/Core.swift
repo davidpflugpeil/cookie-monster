@@ -239,9 +239,9 @@ let kProfileSeed = [
     "commands", "agents", "hooks", "skills", "plugins",
 ]
 
-/// Re-copied on every switch so a profile keeps up with the default. Small and cheap;
-/// `plugins`/`skills` are seeded once because they are tens of megabytes.
-let kProfileSync = ["settings.json", "settings.local.json", "CLAUDE.md", "commands", "agents", "hooks"]
+/// Seeded ONCE, at creation. Deliberately not re-copied on switch: a profile may have its
+/// own settings.json, CLAUDE.md or commands, and overwriting them on every switch silently
+/// destroyed the user's per-profile work. Only mcpServers is pushed on switch.
 
 struct ClaudeProfile {
     let name: String
@@ -279,12 +279,33 @@ private func assertInsideProfiles(_ path: String) -> Bool {
     return (path + "/").hasPrefix(kProfilesDir + "/")
 }
 
+/// Copies with symlinks RESOLVED. FileManager.copyItem preserves them, which would put a
+/// link inside the profile pointing at a shared file (dotfiles repos commonly symlink
+/// ~/.claude/commands, and ~/.claude/skills is symlinked here) — Claude Code would then
+/// write through it, defeating the entire sandbox. `cp -RL` dereferences at every level.
 private func replaceCopy(from src: String, to dst: String) {
     let fm = FileManager.default
     guard fm.fileExists(atPath: src), assertInsideProfiles(dst) else { return }
     try? fm.removeItem(atPath: dst)
-    do { try fm.copyItem(atPath: src, toPath: dst) }
-    catch { log("profile copy failed for \((dst as NSString).lastPathComponent)") }
+    guard runBounded("/bin/cp", ["-RL", src, dst], env: nil, timeout: 120) != nil else {
+        log("profile copy failed for \((dst as NSString).lastPathComponent)")
+        return
+    }
+}
+
+/// Defence in depth: after seeding, nothing in a profile may be a symlink. Anything that is
+/// gets removed rather than left pointing outside the sandbox.
+private func stripSymlinks(under dir: String) {
+    let fm = FileManager.default
+    guard assertInsideProfiles(dir) || dir == kProfilesDir,
+          let e = fm.enumerator(atPath: dir) else { return }
+    for case let rel as String in e {
+        let full = (dir as NSString).appendingPathComponent(rel)
+        if (try? fm.destinationOfSymbolicLink(atPath: full)) != nil, assertInsideProfiles(full) {
+            log("removed symlink inside profile: \(rel)")
+            try? fm.removeItem(atPath: full)
+        }
+    }
 }
 
 func listProfiles() -> [ClaudeProfile] {
@@ -327,27 +348,52 @@ func syncProfile(_ dir: String, seeding: Bool = false) {
     let fm = FileManager.default
     guard assertInsideProfiles(dir) else { return }
     try? fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    try? fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir)
 
-    for entry in (seeding ? kProfileSeed : kProfileSync) {
-        let src = (kClaudeDefaultDir as NSString).appendingPathComponent(entry)
-        if seeding, !kProfileSync.contains(entry),
-           fm.fileExists(atPath: (dir as NSString).appendingPathComponent(entry)) { continue }
-        replaceCopy(from: src, to: (dir as NSString).appendingPathComponent(entry))
+    if seeding {
+        for entry in kProfileSeed {
+            let dst = (dir as NSString).appendingPathComponent(entry)
+            if fm.fileExists(atPath: dst) { continue }   // never clobber what the profile owns
+            replaceCopy(from: (kClaudeDefaultDir as NSString).appendingPathComponent(entry), to: dst)
+        }
+        stripSymlinks(under: dir)
     }
 
     // The profile owns its .claude.json outright — we only push MCP servers into it, so a
     // fresh-init write by a signed-out Claude Code can never reach the real file.
     let target = (dir as NSString).appendingPathComponent(".claude.json")
     var profileCfg: [String: Any] = [:]
-    if let d = fm.contents(atPath: target),
-       let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any] { profileCfg = j }
-    if let d = fm.contents(atPath: kClaudeHomeConfig),
-       let home = try? JSONSerialization.jsonObject(with: d) as? [String: Any] {
-        if let mcp = home["mcpServers"] { profileCfg["mcpServers"] = mcp }
+    if fm.fileExists(atPath: target) {
+        // Present but unreadable means DO NOT TOUCH. Writing a config derived from a failed
+        // read is exactly how v1 destroyed 104 KB of config. Note Claude Code writes JSON via
+        // Node, which emits unpaired surrogate escapes that JSONSerialization rejects — so a
+        // single emoji in that profile's history would otherwise wipe it.
+        guard let d = fm.contents(atPath: target),
+              let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else {
+            log("profile config unreadable; leaving it alone")
+            return
+        }
+        profileCfg = j
     }
-    if !profileCfg.isEmpty, assertInsideProfiles(target),
-       let out = try? JSONSerialization.data(withJSONObject: profileCfg, options: [.prettyPrinted]) {
-        try? out.write(to: URL(fileURLWithPath: target), options: .atomic)
+    guard let hd = fm.contents(atPath: kClaudeHomeConfig),
+          let home = try? JSONSerialization.jsonObject(with: hd) as? [String: Any],
+          let mcp = home["mcpServers"] else { return }
+    profileCfg["mcpServers"] = mcp
+    guard assertInsideProfiles(target),
+          let out = try? JSONSerialization.data(withJSONObject: profileCfg, options: [.prettyPrinted])
+    else { return }
+    try? out.write(to: URL(fileURLWithPath: target), options: .atomic)
+    // #9: the source is 0600 and may carry MCP credentials; .atomic writes 0644 by default.
+    try? fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: target)
+}
+
+/// v0.5.0 built profiles as symlink farms. Those still on disk write straight through into
+/// the real ~/.claude, so they must be neutralised before a profile is ever used.
+func migrateLegacyProfiles() {
+    let fm = FileManager.default
+    for name in (try? fm.contentsOfDirectory(atPath: kProfilesDir)) ?? [] {
+        let dir = (kProfilesDir as NSString).appendingPathComponent(name)
+        stripSymlinks(under: dir)
     }
 }
 
@@ -412,7 +458,10 @@ private var cliPathCheckedAt: Date?
 
 func claudeCLIPath() -> String? {
     cliPathLock.lock(); defer { cliPathLock.unlock() }
-    if let hit = cachedCLIPath { return hit }
+    if let hit = cachedCLIPath {
+        if FileManager.default.isExecutableFile(atPath: hit) { return hit }
+        cachedCLIPath = nil; cliPathCheckedAt = nil     // e.g. the nvm version it lived in went away
+    }
     // Never cache a miss for the process lifetime: the user may install the CLI, or fix
     // their PATH, while the app is running.
     if let checked = cliPathCheckedAt, Date().timeIntervalSince(checked) < 300 { return nil }

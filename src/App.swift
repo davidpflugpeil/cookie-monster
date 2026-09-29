@@ -137,6 +137,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationDidFinishLaunching(_ note: Notification) {
         clearPersistedStatusItemState()   // always reappear, even if dragged off before
+        migrateLegacyProfiles()           // v0.5.0 symlink farms write into the real ~/.claude
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.isVisible = true
         log("launch v\(kVersion) (pin=\(Prefs.pinnedID), every=\(Int(Prefs.interval))s, style=\(Prefs.displayMode.rawValue), claude=\(claudeInstalled()), codex=\(codexInstalled()))")
@@ -681,7 +682,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func refreshClicked() {
-        for p in activeProviders { states[p] = .loading }
+        // Only providers we will actually call: one inside its Retry-After window returns at
+        // the isBlocked guard, so marking it .loading would strand the card there.
+        for p in activeProviders where !isBlocked(p) { states[p] = .loading }
         render(); refresh()
     }
 
