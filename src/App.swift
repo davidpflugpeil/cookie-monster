@@ -105,6 +105,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var profileAuth: [String: AuthStatus] = [:]     // keyed by config dir
     var lastActiveProfile: String = activeProfileDir()
     var claudeGeneration = 0                 // discards fetches issued for a previous profile
+    var discoveryAttempted: Set<String> = [] // one keychain search per profile per launch
 
     /// A monochrome gauge drawn as a template image (so macOS tints it to the menu
     /// bar). The needle reflects `percent`, so it agrees with the number beside it.
@@ -176,6 +177,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refreshProfileIdentities()
     }
 
+    /// A switched profile's token lives in a keychain entry whose name Claude Code derives
+    /// from the config dir. We can't compute it, but we can find and verify it — once. Until
+    /// that succeeds the card shows the profile's identity rather than another account's numbers.
+    private func refreshSwitchedProfile(_ dir: String, generation: Int) {
+        guard !isBlocked(.claude) else { return }
+        if let service = recordedKeychainService(dir), let creds = readCredentials(service: service) {
+            fetchClaudeUsage(creds: creds, email: profileAuth[dir]?.email) { [weak self] result in
+                self?.set(.claude, result, generation: generation)
+            }
+            return
+        }
+        set(.claude, .otherProfile, generation: generation)
+        // Searching costs one keychain prompt, so try at most once per profile per launch and
+        // only when we know which account to verify against.
+        guard let expected = profileAuth[dir]?.email, !discoveryAttempted.contains(dir) else { return }
+        discoveryAttempted.insert(dir)
+        DispatchQueue.global(qos: .utility).async {
+            let service = discoverKeychainService(profileDir: dir, expectedEmail: expected) { creds, done in
+                fetchAccountEmail(creds: creds, completion: done)
+            }
+            guard service != nil else { return }
+            DispatchQueue.main.async { self.refresh() }   // now readable — pick it up immediately
+        }
+    }
+
     /// `claude auth status` per profile — the only way to identify one whose keychain entry
     /// we can't name. Subprocess work, so never on the main thread.
     private func refreshProfileIdentities() {
@@ -215,9 +241,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         guard active.dir == kClaudeDefaultDir else {
-            // Claude Code derives a per-directory keychain entry by an undocumented scheme, so
-            // we can't read another profile's token. Show who it is, never another account's numbers.
-            set(.claude, .otherProfile)
+            refreshSwitchedProfile(active.dir, generation: generation)
             return
         }
         let found = readCredentials()

@@ -2,6 +2,7 @@
 // Foundation-only (no AppKit) so it stays easy to test and reuse.
 
 import Foundation
+import Security
 
 // MARK: - Constants
 
@@ -139,10 +140,10 @@ func versionLess(_ a: String, _ b: String) -> Bool {
 
 /// Reads the raw credential blob from the login keychain via `/usr/bin/security`.
 /// May trigger a one-time macOS "allow access" prompt on first use.
-func keychainBlob() -> String? {
+func keychainBlob(service: String = kKeychainService) -> String? {
     let p = Process()
     p.executableURL = URL(fileURLWithPath: "/usr/bin/security")
-    p.arguments = ["find-generic-password", "-s", kKeychainService, "-w"]
+    p.arguments = ["find-generic-password", "-s", service, "-w"]
     let out = Pipe()
     p.standardOutput = out
     p.standardError = Pipe()
@@ -154,8 +155,8 @@ func keychainBlob() -> String? {
         .trimmingCharacters(in: .whitespacesAndNewlines)
 }
 
-func readCredentials() -> Credentials? {
-    guard let blob = keychainBlob(), !blob.isEmpty else { return nil }
+func readCredentials(service: String = kKeychainService) -> Credentials? {
+    guard let blob = keychainBlob(service: service), !blob.isEmpty else { return nil }
 
     if let data = blob.data(using: .utf8),
        let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
@@ -525,6 +526,70 @@ func shellSnippetInstalled() -> Bool {
            text.contains("cookie-monster/active-profile") { return true }
     }
     return false
+}
+
+// MARK: - Finding a profile's keychain entry
+
+/// Claude Code derives a per-config-dir keychain service name by an undocumented scheme we
+/// could not reproduce. We can still *find* it: enumerating generic-password ATTRIBUTES is
+/// free and silent (no kSecReturnData, so nothing is decrypted and macOS never prompts).
+/// The entry belonging to a profile is the one created when that profile was signed in.
+func claudeCredentialServices() -> [(service: String, created: Date)] {
+    let q: [String: Any] = [
+        kSecClass as String: kSecClassGenericPassword,
+        kSecMatchLimit as String: kSecMatchLimitAll,
+        kSecReturnAttributes as String: true,
+    ]
+    var out: CFTypeRef?
+    guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess,
+          let items = out as? [[String: Any]] else { return [] }
+    return items.compactMap { i in
+        guard let svc = i[kSecAttrService as String] as? String,
+              svc.hasPrefix(kKeychainService + "-") else { return nil }
+        return (svc, (i[kSecAttrCreationDate as String] as? Date) ?? .distantPast)
+    }.sorted { $0.created > $1.created }
+}
+
+private func serviceRecordPath(_ profileDir: String) -> String {
+    (profileDir as NSString).appendingPathComponent(".cookie-monster-keychain")
+}
+
+/// The service name we previously verified for this profile, if any.
+func recordedKeychainService(_ profileDir: String) -> String? {
+    guard let s = try? String(contentsOfFile: serviceRecordPath(profileDir), encoding: .utf8) else { return nil }
+    let name = s.trimmingCharacters(in: .whitespacesAndNewlines)
+    return name.isEmpty ? nil : name
+}
+
+/// Finds and verifies the keychain entry for a profile. Verification matters: picking the
+/// wrong entry would show one subscription's usage under another's name, which is the exact
+/// bug class this app has been bitten by repeatedly. Costs one keychain prompt the first
+/// time (click "Always Allow"), then never searches again.
+func discoverKeychainService(profileDir: String, expectedEmail: String?,
+                             verify: (Credentials, @escaping (String?) -> Void) -> Void) -> String? {
+    if let recorded = recordedKeychainService(profileDir) { return recorded }
+    guard let expected = expectedEmail else { return nil }
+    let created = ((try? FileManager.default.attributesOfItem(atPath: profileDir))?[.creationDate] as? Date)
+        ?? .distantPast
+    // Only entries created at or after the profile existed can belong to it. Newest first:
+    // the right one is almost always the entry written when the user signed the profile in.
+    let candidates = claudeCredentialServices().filter { $0.created >= created }.prefix(3)
+    for candidate in candidates {
+        guard let creds = readCredentials(service: candidate.service) else { continue }
+        let sem = DispatchSemaphore(value: 0)
+        var found: String?
+        verify(creds) { found = $0; sem.signal() }
+        _ = sem.wait(timeout: .now() + 20)
+        guard let email = found else { continue }
+        if email.caseInsensitiveCompare(expected) == .orderedSame {
+            try? candidate.service.write(toFile: serviceRecordPath(profileDir),
+                                         atomically: true, encoding: .utf8)
+            log("profile keychain entry identified for \((profileDir as NSString).lastPathComponent)")
+            return candidate.service
+        }
+    }
+    log("could not identify a keychain entry for \((profileDir as NSString).lastPathComponent)")
+    return nil
 }
 
 // MARK: - Parsing helpers

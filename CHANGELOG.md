@@ -25,11 +25,16 @@ All notable changes to Cookie Monster are documented here. The format is based o
 - **Editor integrations that exec `claude` directly** don't read the shell function
   and keep using your default subscription. The menu warns when the function isn't
   installed at all.
-- **A switched profile shows no usage numbers.** Claude Code derives that profile's
-  keychain entry name by an undocumented scheme, so its token can't be read. The
-  dropdown shows the profile's identity instead of another account's numbers, and
-  the menu-bar item shows `—` rather than substituting the other subscription's
-  percentage.
+- Editor integrations aside, **usage now works for both subscriptions.** Claude Code
+  derives a profile's keychain entry name by an undocumented scheme we can't
+  reproduce — but we can *find* it: enumerating generic-password **attributes** is
+  silent (no `kSecReturnData`, nothing decrypted, no prompt), and the entry for a
+  profile is the one created when that profile was signed in. The candidate is then
+  **verified against `/oauth/account`** before use, so the app can never show one
+  subscription's usage under another's name, and the service name is recorded in the
+  profile so the search happens once. Costs a single keychain prompt per profile
+  ("Always Allow"); until it succeeds the card shows the profile's identity rather
+  than another account's numbers.
 
 ### Note on the reverted v0.5.0
 An earlier attempt built profiles as **symlinks** to the real config. A profile that
