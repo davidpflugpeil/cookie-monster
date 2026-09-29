@@ -106,6 +106,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var lastActiveProfile: String = activeProfileDir()
     var claudeGeneration = 0                 // discards fetches issued for a previous profile
     var discoveryAttempted: Set<String> = [] // one keychain search per profile per launch
+    var profileUsage: [String: ProviderUsage] = [:]   // usage per profile, for the switcher
+    var profileBlocked: [String: Date] = [:]          // per-profile 429 backoff
 
     /// A monochrome gauge drawn as a template image (so macOS tints it to the menu
     /// bar). The needle reflects `percent`, so it agrees with the number beside it.
@@ -177,31 +179,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refreshProfileIdentities()
     }
 
-    /// A switched profile's token lives in a keychain entry whose name Claude Code derives
-    /// from the config dir. We can't compute it, but we can find and verify it — once. Until
-    /// that succeeds the card shows the profile's identity rather than another account's numbers.
-    private func refreshSwitchedProfile(_ dir: String, generation: Int) {
-        guard !isBlocked(.claude) else { return }
-        if let service = recordedKeychainService(dir), let creds = readCredentials(service: service) {
-            fetchClaudeUsage(creds: creds, email: profileAuth[dir]?.email) { [weak self] result in
-                self?.set(.claude, result, generation: generation)
-            }
-            return
-        }
-        set(.claude, .otherProfile, generation: generation)
-        // Searching costs one keychain prompt, so try at most once per profile per launch and
-        // only when we know which account to verify against.
-        guard let expected = profileAuth[dir]?.email, !discoveryAttempted.contains(dir) else { return }
-        discoveryAttempted.insert(dir)
-        DispatchQueue.global(qos: .utility).async {
-            let service = discoverKeychainService(profileDir: dir, expectedEmail: expected) { creds, done in
-                fetchAccountEmail(creds: creds, completion: done)
-            }
-            guard service != nil else { return }
-            DispatchQueue.main.async { self.refresh() }   // now readable — pick it up immediately
-        }
-    }
-
     /// `claude auth status` per profile — the only way to identify one whose keychain entry
     /// we can't name. Subprocess work, so never on the main thread.
     private func refreshProfileIdentities() {
@@ -240,35 +217,70 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             set(.claude, .error("profile folder missing — pick another subscription"))
             return
         }
-        guard active.dir == kClaudeDefaultDir else {
-            refreshSwitchedProfile(active.dir, generation: generation)
-            return
-        }
-        let found = readCredentials()
-        guard claudeInstalled() || found != nil else {
+        guard claudeInstalled() || readCredentials() != nil else {
             set(.claude, .notConfigured); return
         }
         if states[.claude] == nil { states[.claude] = .loading }
-        guard let creds = found else {
-            log("claude: no credentials in keychain")
-            claudeEmail = nil; claudeEmailToken = nil
-            set(.claude, .needsAuth); return
-        }
-        // The email has to come from the *same token* that produces the numbers. Claude
-        // Code keeps a credential store per config/session, and ~/.claude.json can name a
-        // different account than the keychain token we poll with — so reading the email
-        // from there labelled one account's usage with another account's address.
-        // Resolve it from the token instead, once per token: that's one request per
-        // sign-in or token refresh rather than per poll, so it doesn't bring back the 429s.
-        if creds.accessToken != claudeEmailToken && !claudeEmailInFlight {
-            resolveClaudeEmail(creds)
-        }
-
-        guard !isBlocked(.claude) else { return }
-        fetchClaudeUsage(creds: creds, email: claudeEmail) { [weak self] result in
-            self?.set(.claude, result, generation: generation)
+        // Every profile, not just the active one — the switcher shows each subscription's
+        // pinned metric, so each needs its own reading.
+        for prof in listProfiles() {
+            fetchProfileUsage(prof, isActive: prof.configDir == active.dir, generation: generation)
         }
     }
+
+    /// Reads one profile's usage. The default profile uses the plain keychain service; a
+    /// switched profile uses the entry discovered and verified for it.
+    private func fetchProfileUsage(_ prof: ClaudeProfile, isActive: Bool, generation: Int) {
+        if let until = profileBlocked[prof.configDir], Date() < until { return }
+        if isActive, isBlocked(.claude) { return }
+        let dir = prof.configDir
+        DispatchQueue.global(qos: .utility).async {
+            let service = prof.isDefault ? kKeychainService : recordedKeychainService(dir)
+            guard let service = service, let creds = readCredentials(service: service) else {
+                DispatchQueue.main.async {
+                    if isActive { self.set(.claude, .otherProfile, generation: generation) }
+                    self.attemptDiscovery(prof)
+                }
+                return
+            }
+            DispatchQueue.main.async {
+                // The default profile's email must come from the token that produced the
+                // numbers; a switched profile's comes from `claude auth status`.
+                if prof.isDefault, creds.accessToken != self.claudeEmailToken,
+                   !self.claudeEmailInFlight {
+                    self.claudeEmail = nil
+                    self.resolveClaudeEmail(creds)
+                }
+                let email = prof.isDefault ? self.claudeEmail : self.profileAuth[dir]?.email
+                fetchClaudeUsage(creds: creds, email: email) { result in
+                    DispatchQueue.main.async {
+                        switch result {
+                        case .ok(let u): self.profileUsage[dir] = u
+                        case .rateLimited(let until): self.profileBlocked[dir] = until
+                        default: break
+                        }
+                        if isActive { self.set(.claude, result, generation: generation) }
+                        self.render()
+                    }
+                }
+            }
+        }
+    }
+
+    /// One silent keychain search per profile per launch; see discoverKeychainService.
+    private func attemptDiscovery(_ prof: ClaudeProfile) {
+        let dir = prof.configDir
+        guard !prof.isDefault, recordedKeychainService(dir) == nil,
+              let expected = profileAuth[dir]?.email, !discoveryAttempted.contains(dir) else { return }
+        discoveryAttempted.insert(dir)
+        DispatchQueue.global(qos: .utility).async {
+            let found = discoverKeychainService(profileDir: dir, expectedEmail: expected) { creds, done in
+                fetchAccountEmail(creds: creds, completion: done)
+            }
+            if found != nil { DispatchQueue.main.async { self.refresh() } }
+        }
+    }
+
 
     private func resolveClaudeEmail(_ creds: Credentials) {
         claudeEmailInFlight = true
@@ -567,6 +579,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    /// The subscriptions the switcher offers, each showing the pinned metric for that account.
+    private func switcherAccounts() -> [InfoCardView.Account] {
+        let profiles = listProfiles()
+        guard profiles.count > 1 else { return [] }
+        let active = activeProfileDir()
+        let pinned = Prefs.pinnedID
+        return profiles.map { prof in
+            let usage = profileUsage[prof.configDir]
+            let pct = usage?.metrics.first { $0.id == pinned }?.pct ?? usage?.metrics.first?.pct
+            let label = profileAuth[prof.configDir]?.email
+                ?? usage?.email
+                ?? (prof.isDefault ? (claudeEmail ?? prof.name) : prof.name)
+            return InfoCardView.Account(dir: prof.configDir, label: label, pct: pct,
+                                        active: prof.configDir == active)
+        }
+    }
+
     private func addCard(_ menu: NSMenu, _ p: Provider, _ u: ProviderUsage,
                          note: @escaping () -> String? = { nil }) {
         let rows = u.metrics.map {
@@ -579,6 +608,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                 rows: rows,
                                 fetchedAt: u.fetchedAt,
                                 note: note,
+                                accounts: p == .claude ? switcherAccounts() : [],
+                                onSwitch: { [weak self] dir in self?.switchProfile(to: dir) },
                                 pinnedID: pinnedMetric?.id) { [weak self] id in
             self?.pick(id)
         }
@@ -722,6 +753,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         pick(id)
     }
 
+    func switchProfile(to dir: String) {
+        if dir != kClaudeDefaultDir { syncProfile(dir) }
+        guard setActiveProfile(dir) else { return }
+        log("active profile set → \(dir)")
+        refresh()
+        render()
+    }
+
     @objc func setProfile(_ sender: NSMenuItem) {
         guard let dir = sender.representedObject as? String else { return }
         // Re-copy settings and MCP servers from the default before handing over, so a profile
@@ -802,9 +841,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
 final class InfoCardView: NSView {
     struct Row { let id: String; let name: String; let pct: Double; let resets: Date? }
+    /// One switchable subscription, with the pinned metric's value for that account.
+    struct Account { let dir: String; let label: String; let pct: Double?; let active: Bool }
 
     private let title: String
     private let email: String?
+    private let accounts: [Account]
+    private let onSwitch: (String) -> Void
     private let note: () -> String?
     private let rows: [Row]
     private let fetchedAt: Date
@@ -812,10 +855,13 @@ final class InfoCardView: NSView {
     private let onPick: (String) -> Void
     /// Filled during layout so a click can find the row underneath it.
     private var hitRects: [(rect: NSRect, id: String)] = []
+    private var accountRects: [(rect: NSRect, dir: String)] = []
 
     init(title: String, email: String?, rows: [Row], fetchedAt: Date, note: @escaping () -> String? = { nil },
+         accounts: [Account] = [], onSwitch: @escaping (String) -> Void = { _ in },
          pinnedID: String?, onPick: @escaping (String) -> Void) {
         self.title = title; self.email = email; self.rows = rows; self.note = note
+        self.accounts = accounts; self.onSwitch = onSwitch
         self.fetchedAt = fetchedAt; self.pinnedID = pinnedID; self.onPick = onPick
         super.init(frame: NSRect(x: 0, y: 0, width: 300, height: 10))
         setFrameSize(NSSize(width: 300, height: layout(false)))   // exact fit to content
@@ -827,6 +873,11 @@ final class InfoCardView: NSView {
     // Clicking a usage row pins it to the menu bar, then closes the menu.
     override func mouseDown(with event: NSEvent) {
         let p = convert(event.locationInWindow, from: nil)
+        if let acct = accountRects.first(where: { $0.rect.contains(p) }) {
+            enclosingMenuItem?.menu?.cancelTracking()
+            onSwitch(acct.dir)
+            return
+        }
         guard let hit = hitRects.first(where: { $0.rect.contains(p) }) else { return }
         enclosingMenuItem?.menu?.cancelTracking()
         onPick(hit.id)
@@ -855,9 +906,36 @@ final class InfoCardView: NSView {
         hitRects.removeAll()
         let x: CGFloat = 16, w = bounds.width, cw = w - x * 2
         var y: CGFloat = 13
+        accountRects.removeAll()
         if paint { left(t(title, .systemFont(ofSize: 13, weight: .bold), .secondaryLabelColor), x, y) }
-        y += 18
-        if let email = email {
+        y += accounts.count > 1 ? 23 : 18   // the switcher's tint needs air under the title
+        if accounts.count > 1 {
+            // A switcher, not a label: each row is the account plus its pinned metric, and
+            // clicking one makes it the subscription `claude` uses.
+            for a in accounts {
+                let block = NSRect(x: x - 8, y: y - 4, width: cw + 16, height: 22)
+                accountRects.append((block, a.dir))
+                if paint {
+                    if a.active {
+                        NSColor.controlAccentColor.withAlphaComponent(0.12).setFill()
+                        NSBezierPath(roundedRect: block, xRadius: 6, yRadius: 6).fill()
+                    }
+                    let dot = NSRect(x: x, y: y + 4, width: 6, height: 6)
+                    (a.active ? NSColor.controlAccentColor : NSColor.quaternaryLabelColor).setFill()
+                    NSBezierPath(ovalIn: dot).fill()
+                    left(t(a.label, .systemFont(ofSize: 12, weight: a.active ? .semibold : .regular),
+                           a.active ? .labelColor : .secondaryLabelColor), x + 14, y)
+                    if let pct = a.pct {
+                        right(t(String(format: "%.0f%%", pct),
+                                .monospacedDigitSystemFont(ofSize: 12, weight: a.active ? .bold : .regular),
+                                a.active ? .labelColor : .secondaryLabelColor), w - x, y)
+                    } else {
+                        right(t("—", .systemFont(ofSize: 12, weight: .regular), .tertiaryLabelColor), w - x, y)
+                    }
+                }
+                y += 24
+            }
+        } else if let email = email {
             if paint { left(t(email, .systemFont(ofSize: 12, weight: .regular), .tertiaryLabelColor), x, y) }
             y += 18
         }

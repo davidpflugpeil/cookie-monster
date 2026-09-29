@@ -7,6 +7,11 @@ All notable changes to Cookie Monster are documented here. The format is based o
 ## [Unreleased] — branch `profile-switch-v2`
 
 ### Added
+- **An account switcher at the top of the Claude card.** Every subscription is listed
+  with the value of your pinned metric for *that* account, the active one marked;
+  click a row to switch. All profiles are polled, not just the active one, so the
+  numbers are live for each. Each account has its own rate-limit budget, and a 429
+  backs off per profile rather than for Claude as a whole.
 - **Switch between two Claude subscriptions without logging out.** Keep both signed
   in and pick the active one from **Active Subscription** in the menu.
   - A profile is a config directory under `~/.cookie-monster/profiles/` holding
