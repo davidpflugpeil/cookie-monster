@@ -4,6 +4,42 @@ All notable changes to Cookie Monster are documented here. The format is based o
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased] — branch `profile-switch-v2`
+
+### Added
+- **Switch between two Claude subscriptions without logging out.** Keep both signed
+  in and pick the active one from **Active Subscription** in the menu.
+  - A profile is a config directory under `~/.cookie-monster/profiles/` holding
+    **copies** of your settings and MCP servers. Claude Code keys its keychain entry
+    to the directory path, which is what lets both accounts stay signed in.
+  - **Copy Shell Setup** gives you a shell function for your rc file. It re-reads the
+    active subscription on every `claude` invocation, so switching applies to
+    terminals that are already open.
+  - Switching re-syncs settings and MCP servers from your default config into the
+    profile — one direction only, default → profile. Your own config is never
+    written to; every write is gated to `~/.cookie-monster/profiles`.
+  - `projects` (session history) is **not** copied: it is gigabytes, and each profile
+    keeps its own.
+
+### Known limitations
+- **Editor integrations that exec `claude` directly** don't read the shell function
+  and keep using your default subscription. The menu warns when the function isn't
+  installed at all.
+- **A switched profile shows no usage numbers.** Claude Code derives that profile's
+  keychain entry name by an undocumented scheme, so its token can't be read. The
+  dropdown shows the profile's identity instead of another account's numbers, and
+  the menu-bar item shows `—` rather than substituting the other subscription's
+  percentage.
+
+### Note on the reverted v0.5.0
+An earlier attempt built profiles as **symlinks** to the real config. A profile that
+wasn't signed in yet caused Claude Code to initialise a fresh config, and that write
+replaced the symlink rather than following it — landing on the shared original and
+truncating `~/.claude.json` and `~/.claude/settings.json`. That version was reverted
+(`b41491f`); this one never symlinks anything, and the failing path is covered by a
+hermetic test that runs the real CLI under a signed-out profile and asserts the
+originals are byte-identical.
+
 ## [0.4.6] — 2026-09-21
 
 ### Fixed
