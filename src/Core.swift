@@ -14,7 +14,7 @@ let kCodexDir = (NSHomeDirectory() as NSString).appendingPathComponent(".codex")
 let kCodexAuthPath = (kCodexDir as NSString).appendingPathComponent("auth.json")
 let kLoginPlistLabel = "com.pflugpeil.cookiemonster"
 let kPollInterval: TimeInterval = 300
-let kLogDir = (NSHomeDirectory() as NSString).appendingPathComponent(".cookie-monster")
+let kLogDir = (cmHome() as NSString).appendingPathComponent(".cookie-monster")
 let kLogFile = (kLogDir as NSString).appendingPathComponent("cookie-monster.log")
 let kVersion = "0.4.6"
 
@@ -81,6 +81,7 @@ enum FetchState {
     case ok(ProviderUsage)
     case needsAuth          // installed but no token, or 401/403
     case rateLimited(Date)  // 429 — do not call again before this date
+    case otherProfile      // a non-default profile is active; its token isn't readable
     case error(String)
 }
 
@@ -212,6 +213,269 @@ func readCodexCredentials() -> CodexCredentials? {
           let token = tokens["access_token"] as? String, !token.isEmpty else { return nil }
     return CodexCredentials(accessToken: token,
                             accountId: (tokens["account_id"] as? String) ?? "")
+}
+
+// MARK: - Claude profiles (copy-based; never writes outside ~/.cookie-monster)
+
+/// NSHomeDirectory() reads getpwuid and ignores $HOME, so tests cannot sandbox it.
+/// COOKIE_MONSTER_HOME exists purely so the profile system can be exercised against a
+/// throwaway home; unset in normal use.
+func cmHome() -> String {
+    ProcessInfo.processInfo.environment["COOKIE_MONSTER_HOME"] ?? NSHomeDirectory()
+}
+
+let kClaudeDefaultDir = (cmHome() as NSString).appendingPathComponent(".claude")
+let kClaudeHomeConfig = (cmHome() as NSString).appendingPathComponent(".claude.json")
+let kProfilesDir = (kLogDir as NSString).appendingPathComponent("profiles")
+let kActiveProfileFile = (kLogDir as NSString).appendingPathComponent("active-profile")
+
+/// v1 of this feature symlinked a profile's files to the real ones. That destroyed the
+/// user's config: a profile that isn't signed in yet makes Claude Code initialise a fresh
+/// config, and that write does NOT always go through the symlink — it replaces it, landing
+/// on the shared original. So nothing is ever symlinked now. A profile holds COPIES, and
+/// the app only ever writes inside kProfilesDir.
+let kProfileSeed = [
+    "settings.json", "settings.local.json", "CLAUDE.md",
+    "commands", "agents", "hooks", "skills", "plugins",
+]
+
+/// Re-copied on every switch so a profile keeps up with the default. Small and cheap;
+/// `plugins`/`skills` are seeded once because they are tens of megabytes.
+let kProfileSync = ["settings.json", "settings.local.json", "CLAUDE.md", "commands", "agents", "hooks"]
+
+struct ClaudeProfile {
+    let name: String
+    let configDir: String
+    var isDefault: Bool { configDir == kClaudeDefaultDir }
+    /// nil means CLAUDE_CONFIG_DIR is unset — the only way to reach the default profile's
+    /// credentials. Setting it to ~/.claude keys a different keychain entry entirely.
+    var envConfigDir: String? { isDefault ? nil : configDir }
+}
+
+struct AuthStatus {
+    var loggedIn: Bool
+    var email: String?
+    var plan: String?
+    var orgName: String?
+}
+
+/// A profile name becomes a directory under kProfilesDir. "." and ".." survive
+/// appendingPathComponent unnormalised and would escape it.
+func isValidProfileName(_ raw: String) -> Bool {
+    let name = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !name.isEmpty, name.count <= 40, !name.hasPrefix("."),
+          name.lowercased() != "default" else { return false }
+    let allowed = CharacterSet(charactersIn:
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_ ")
+    return name.unicodeScalars.allSatisfy { allowed.contains($0) }
+}
+
+/// Guarantees every write stays inside kProfilesDir, whatever the caller passes.
+private func assertInsideProfiles(_ path: String) -> Bool {
+    // Raw comparison on purpose: standardizingPath resolves /private/tmp -> /tmp only for
+    // paths that already exist, so standardizing an as-yet-uncreated destination against an
+    // existing root silently rejects every legitimate copy.
+    guard !path.contains("/../"), !path.hasSuffix("/.."), !path.contains("//") else { return false }
+    return (path + "/").hasPrefix(kProfilesDir + "/")
+}
+
+private func replaceCopy(from src: String, to dst: String) {
+    let fm = FileManager.default
+    guard fm.fileExists(atPath: src), assertInsideProfiles(dst) else { return }
+    try? fm.removeItem(atPath: dst)
+    do { try fm.copyItem(atPath: src, toPath: dst) }
+    catch { log("profile copy failed for \((dst as NSString).lastPathComponent)") }
+}
+
+func listProfiles() -> [ClaudeProfile] {
+    var out = [ClaudeProfile(name: "Default", configDir: kClaudeDefaultDir)]
+    for name in ((try? FileManager.default.contentsOfDirectory(atPath: kProfilesDir)) ?? []).sorted()
+    where !name.hasPrefix(".") {
+        let dir = (kProfilesDir as NSString).appendingPathComponent(name)
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: dir, isDirectory: &isDir), isDir.boolValue else { continue }
+        out.append(ClaudeProfile(name: name, configDir: dir))
+    }
+    return out
+}
+
+/// The configured profile and whether its directory still exists. Callers must not quietly
+/// fall back to the default: the shell function doesn't, so the app would report one account
+/// while every terminal keeps using another.
+func activeProfile() -> (dir: String, missing: Bool) {
+    guard let raw = try? String(contentsOfFile: kActiveProfileFile, encoding: .utf8) else {
+        return (kClaudeDefaultDir, false)
+    }
+    let dir = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    if dir.isEmpty || dir == kClaudeDefaultDir { return (kClaudeDefaultDir, false) }
+    return (dir, !FileManager.default.fileExists(atPath: dir))
+}
+
+func activeProfileDir() -> String { activeProfile().dir }
+
+@discardableResult
+func setActiveProfile(_ configDir: String) -> Bool {
+    try? FileManager.default.createDirectory(atPath: kLogDir, withIntermediateDirectories: true)
+    do { try (configDir + "\n").write(toFile: kActiveProfileFile, atomically: true, encoding: .utf8); return true }
+    catch { log("could not write active-profile"); return false }
+}
+
+/// Copies the default profile's config into `dir`, and merges the current `mcpServers` into
+/// the profile's own .claude.json — never the other way round. `projects` (gigabytes of
+/// history) is deliberately not copied.
+func syncProfile(_ dir: String, seeding: Bool = false) {
+    let fm = FileManager.default
+    guard assertInsideProfiles(dir) else { return }
+    try? fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
+
+    for entry in (seeding ? kProfileSeed : kProfileSync) {
+        let src = (kClaudeDefaultDir as NSString).appendingPathComponent(entry)
+        if seeding, !kProfileSync.contains(entry),
+           fm.fileExists(atPath: (dir as NSString).appendingPathComponent(entry)) { continue }
+        replaceCopy(from: src, to: (dir as NSString).appendingPathComponent(entry))
+    }
+
+    // The profile owns its .claude.json outright — we only push MCP servers into it, so a
+    // fresh-init write by a signed-out Claude Code can never reach the real file.
+    let target = (dir as NSString).appendingPathComponent(".claude.json")
+    var profileCfg: [String: Any] = [:]
+    if let d = fm.contents(atPath: target),
+       let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any] { profileCfg = j }
+    if let d = fm.contents(atPath: kClaudeHomeConfig),
+       let home = try? JSONSerialization.jsonObject(with: d) as? [String: Any] {
+        if let mcp = home["mcpServers"] { profileCfg["mcpServers"] = mcp }
+    }
+    if !profileCfg.isEmpty, assertInsideProfiles(target),
+       let out = try? JSONSerialization.data(withJSONObject: profileCfg, options: [.prettyPrinted]) {
+        try? out.write(to: URL(fileURLWithPath: target), options: .atomic)
+    }
+}
+
+func createProfile(name rawName: String) throws -> ClaudeProfile {
+    let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard isValidProfileName(name) else {
+        throw NSError(domain: "CookieMonster", code: 1, userInfo: [
+            NSLocalizedDescriptionKey: "Use letters, numbers, spaces, - or _ (not \"Default\")."])
+    }
+    let dir = (kProfilesDir as NSString).appendingPathComponent(name)
+    syncProfile(dir, seeding: true)
+    log("created profile \(name)")
+    return ClaudeProfile(name: name, configDir: dir)
+}
+
+let kShellSnippet = """
+claude() {
+  local p; p="$(cat ~/.cookie-monster/active-profile 2>/dev/null)"
+  if [ -n "$p" ] && [ "$p" != "$HOME/.claude" ]; then
+    CLAUDE_CONFIG_DIR="$p" command claude "$@"
+  else
+    command claude "$@"
+  fi
+}
+"""
+
+/// Runs a command with a hard deadline. stdout is drained on another queue so the deadline
+/// can actually fire, and the process is never waited on inline: an rc file that spawns a
+/// background process inheriting stdout keeps the pipe open long after the shell exits.
+func runBounded(_ executable: String, _ args: [String], env: [String: String]?,
+                timeout: TimeInterval) -> Data? {
+    final class Box { var data = Data() }
+    let box = Box()
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: executable)
+    p.arguments = args
+    if let env = env { p.environment = env }
+    let out = Pipe()
+    p.standardOutput = out
+    p.standardError = FileHandle.nullDevice
+    p.standardInput = FileHandle.nullDevice
+    do { try p.run() } catch { return nil }
+    let done = DispatchSemaphore(value: 0)
+    DispatchQueue.global(qos: .utility).async {
+        box.data = out.fileHandleForReading.readDataToEndOfFile()
+        done.signal()
+    }
+    if done.wait(timeout: .now() + timeout) == .timedOut {
+        p.terminate()
+        _ = done.wait(timeout: .now() + 2)
+        DispatchQueue.global(qos: .utility).async { p.waitUntilExit() }
+        log("timed out running \((executable as NSString).lastPathComponent)")
+        return nil
+    }
+    DispatchQueue.global(qos: .utility).async { p.waitUntilExit() }
+    return box.data
+}
+
+private let cliPathLock = NSLock()
+private var cachedCLIPath: String?
+private var cliPathCheckedAt: Date?
+
+func claudeCLIPath() -> String? {
+    cliPathLock.lock(); defer { cliPathLock.unlock() }
+    if let hit = cachedCLIPath { return hit }
+    // Never cache a miss for the process lifetime: the user may install the CLI, or fix
+    // their PATH, while the app is running.
+    if let checked = cliPathCheckedAt, Date().timeIntervalSince(checked) < 300 { return nil }
+    let home = cmHome() as NSString
+    let candidates = [
+        home.appendingPathComponent(".local/bin/claude"), "/opt/homebrew/bin/claude",
+        "/usr/local/bin/claude", home.appendingPathComponent(".bun/bin/claude"),
+        home.appendingPathComponent(".npm-global/bin/claude"),
+    ]
+    var found = candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
+    if found == nil { found = whichClaudeViaLoginShell() }
+    cliPathCheckedAt = Date()
+    cachedCLIPath = found
+    return found
+}
+
+private func whichClaudeViaLoginShell() -> String? {
+    let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
+    // -i matters: zsh/bash source ~/.zshrc / ~/.bashrc only for *interactive* shells, which
+    // is exactly where nvm and npm-prefix installs put their PATH. `unset -f claude` matters
+    // too: once our own shell function is installed, `command -v claude` answers with the
+    // function name rather than a path.
+    guard let data = runBounded(shell, ["-ilc", "unset -f claude 2>/dev/null; command -v claude"],
+                                env: nil, timeout: 10),
+          let text = String(data: data, encoding: .utf8) else { return nil }
+    let path = text.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }
+        .last { !$0.isEmpty } ?? ""
+    guard path.hasPrefix("/"), FileManager.default.isExecutableFile(atPath: path) else { return nil }
+    return path
+}
+
+/// `claude auth status` answers differently under CLAUDE_CODE_USE_BEDROCK or an ANTHROPIC_*
+/// override — loggedIn with no email — so strip anything that redirects auth before asking.
+func claudeProbeEnv(configDir: String?) -> [String: String] {
+    var env = ProcessInfo.processInfo.environment
+    for key in env.keys where key.hasPrefix("ANTHROPIC_") || key.hasPrefix("CLAUDE_CODE_")
+        || key == "CLAUDE_CONFIG_DIR" { env.removeValue(forKey: key) }
+    // Setting CLAUDE_CONFIG_DIR at all keys a different keychain entry — even when set to
+    // ~/.claude itself, which then reads as signed out. The default profile means *unset*.
+    if let dir = configDir { env["CLAUDE_CONFIG_DIR"] = dir }
+    return env
+}
+
+/// Pass nil for the default profile. `email` is often null — Claude Code mirrors
+/// ~/.claude.json's oauthAccount there — so callers must not treat that as signed out.
+func claudeAuthStatus(configDir: String?, timeout: TimeInterval = 15) -> AuthStatus? {
+    guard let cli = claudeCLIPath() else { return nil }
+    guard let data = runBounded(cli, ["auth", "status"],
+                                env: claudeProbeEnv(configDir: configDir), timeout: timeout),
+          let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+    return AuthStatus(loggedIn: (root["loggedIn"] as? Bool) ?? false,
+                      email: root["email"] as? String,
+                      plan: root["subscriptionType"] as? String,
+                      orgName: root["orgName"] as? String)
+}
+
+/// Without the shell function installed, switching changes nothing `claude` will ever see.
+func shellSnippetInstalled() -> Bool {
+    for rc in ["/.zshrc", "/.zprofile", "/.bashrc", "/.bash_profile", "/.profile"] {
+        if let text = try? String(contentsOfFile: cmHome() + rc, encoding: .utf8),
+           text.contains("cookie-monster/active-profile") { return true }
+    }
+    return false
 }
 
 // MARK: - Parsing helpers

@@ -102,6 +102,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var nextAllowed: [Provider: Date] = [:]         // earliest next call, per provider
     var failures: [Provider: Int] = [:]             // consecutive failures → backoff
     var menuIsOpen = false                   // drives the in-place rebuild in render()
+    var profileAuth: [String: AuthStatus] = [:]     // keyed by config dir
+    var lastActiveProfile: String = activeProfileDir()
+    var claudeGeneration = 0                 // discards fetches issued for a previous profile
 
     /// A monochrome gauge drawn as a template image (so macOS tints it to the menu
     /// bar). The needle reflects `percent`, so it agrees with the number beside it.
@@ -169,6 +172,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func refresh() {
         refreshClaude()
         refreshCodex()
+        refreshProfileIdentities()
+    }
+
+    /// `claude auth status` per profile — the only way to identify one whose keychain entry
+    /// we can't name. Subprocess work, so never on the main thread.
+    private func refreshProfileIdentities() {
+        let profiles = listProfiles()
+        DispatchQueue.global(qos: .utility).async {
+            var found: [String: AuthStatus] = [:]
+            for p in profiles {
+                if let a = claudeAuthStatus(configDir: p.envConfigDir) { found[p.configDir] = a }
+            }
+            DispatchQueue.main.async { self.profileAuth = found; self.render() }
+        }
     }
 
     /// True while a provider is inside a Retry-After / backoff window. Calling anyway is
@@ -180,6 +197,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func refreshClaude() {
+        let active = activeProfile()
+        if active.dir != lastActiveProfile {
+            log("active profile → \(active.dir)")
+            lastActiveProfile = active.dir
+            claudeGeneration += 1            // anything in flight belongs to the old profile
+            lastGood[.claude] = nil
+            nextAllowed[.claude] = nil
+            claudeEmail = nil; claudeEmailToken = nil
+        }
+        let generation = claudeGeneration
+        guard !active.missing else {
+            // The folder is gone, but the shell function does NOT fall back — terminals keep
+            // using it. Say so instead of showing the Default account's numbers.
+            set(.claude, .error("profile folder missing — pick another subscription"))
+            return
+        }
+        guard active.dir == kClaudeDefaultDir else {
+            // Claude Code derives a per-directory keychain entry by an undocumented scheme, so
+            // we can't read another profile's token. Show who it is, never another account's numbers.
+            set(.claude, .otherProfile)
+            return
+        }
         let found = readCredentials()
         guard claudeInstalled() || found != nil else {
             set(.claude, .notConfigured); return
@@ -202,7 +241,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         guard !isBlocked(.claude) else { return }
         fetchClaudeUsage(creds: creds, email: claudeEmail) { [weak self] result in
-            self?.set(.claude, result)
+            self?.set(.claude, result, generation: generation)
         }
     }
 
@@ -255,8 +294,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    private func set(_ p: Provider, _ s: FetchState) {
+    /// `generation` guards a fetch issued before a profile switch. Compared inside the same
+    /// main-queue block that mutates, so a switch can't slip in between.
+    private func set(_ p: Provider, _ s: FetchState, generation: Int? = nil) {
         DispatchQueue.main.async {
+            if let g = generation, g != self.claudeGeneration { return }
             switch s {
             case .ok(let u):
                 self.lastGood[p] = u
@@ -273,7 +315,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 let wait = min(Prefs.interval * pow(2, Double(min(n, 5))), 1800)
                 self.nextAllowed[p] = Date().addingTimeInterval(wait)
                 log("\(p.rawValue) error #\(n) → retry in \(Int(wait))s")
-            case .needsAuth, .notConfigured, .loading:
+            case .needsAuth, .notConfigured, .loading, .otherProfile:
                 self.nextAllowed[p] = nil
             }
             self.states[p] = s
@@ -312,6 +354,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    private func isNotConfigured(_ s: FetchState) -> Bool {
+        if case .notConfigured = s { return true }
+        return false
+    }
+
     /// The window shown in the menu bar. Resolution order matters: a provider that is
     /// rate limited has no live metrics, and jumping to the *other* subscription's number
     /// would be worse than showing the pinned one's last known value.
@@ -326,6 +373,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let p = Provider(rawValue: id.split(separator: ".").first.map(String.init) ?? "") {
             if let m = live.first(where: { $0.provider == p }) { return m }
             if let m = cached.first(where: { $0.provider == p }) { return m }
+            // Present but unreadable (switched profile, signed out, errored). The menu bar
+            // carries no label, so another provider's percentage would read as this one's.
+            if let st = states[p], !isNotConfigured(st) { return nil }
         }
         return live.first ?? cached.first
     }
@@ -434,6 +484,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             it.representedObject = p.rawValue
             menu.addItem(it)
         }
+        menu.addItem(profileSubmenuItem())
         menu.addItem(pinSubmenuItem())
         menu.addItem(intervalSubmenuItem())
         menu.addItem(displaySubmenuItem())
@@ -465,6 +516,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 disabled(menu, "\(p.label) — rate limited", bold: true)
                 disabled(menu, "retrying in \(countdown(to: until))", bold: false)
             }
+        case .otherProfile:
+            // Looked up here, not captured in the state: the probe answers asynchronously.
+            let dir = activeProfileDir()
+            let auth = profileAuth[dir]
+            let name = listProfiles().first { $0.configDir == dir }?.name ?? "profile"
+            disabled(menu, "Claude — \(auth?.email ?? name)", bold: true)
+            let detail: String
+            if let auth = auth {
+                detail = auth.loggedIn ? "usage unavailable for a switched profile"
+                                       : "not signed in — run `claude` and /login"
+            } else {
+                detail = "couldn't identify this profile (is `claude` on your PATH?)"
+            }
+            disabled(menu, detail, bold: false)
         case .error(let msg):
             if let u = lastGood[p] {
                 addCard(menu, p, u) { "couldn't refresh" }
@@ -510,6 +575,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     /// Lists every pinnable window, grouped by provider.
+    /// Switch which subscription `claude` uses. Each profile is a config dir holding COPIES
+    /// of your config — never symlinks — and Claude Code keys its keychain entry to the
+    /// directory path, which is what keeps both accounts signed in at once.
+    func profileSubmenuItem() -> NSMenuItem {
+        let sub = NSMenu()
+        sub.autoenablesItems = false
+        let active = activeProfileDir()
+        for prof in listProfiles() {
+            let auth = profileAuth[prof.configDir]
+            var title = prof.name
+            if let email = auth?.email, !email.isEmpty {
+                title += " — \(email)"
+            } else if let auth = auth {
+                // `claude auth status` reports email only when ~/.claude.json still carries
+                // oauthAccount; it is frequently null. Say what we do know.
+                title += auth.loggedIn ? " — signed in\(auth.plan.map { " (\($0.capitalized))" } ?? "")"
+                                       : " — not signed in"
+            }
+            let it = NSMenuItem(title: title, action: #selector(setProfile(_:)), keyEquivalent: "")
+            it.target = self
+            it.representedObject = prof.configDir
+            it.state = (prof.configDir == active) ? .on : .off
+            sub.addItem(it)
+        }
+        sub.addItem(.separator())
+        if listProfiles().count > 1 && !shellSnippetInstalled() {
+            disabled(sub, "⚠︎ Shell setup not installed — switching won't affect `claude`", bold: false)
+        }
+        sub.addItem(item("Add Subscription…", #selector(addProfile), ""))
+        sub.addItem(item(shellSnippetInstalled() ? "Copy Shell Setup" : "Copy Shell Setup (required)",
+                         #selector(copyShellSetup), ""))
+        let parent = NSMenuItem(title: "Active Subscription", action: nil, keyEquivalent: "")
+        parent.submenu = sub
+        return parent
+    }
+
     func pinSubmenuItem() -> NSMenuItem {
         let sub = NSMenu()
         sub.autoenablesItems = false
@@ -592,6 +693,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func setPinned(_ sender: NSMenuItem) {
         guard let id = sender.representedObject as? String else { return }
         pick(id)
+    }
+
+    @objc func setProfile(_ sender: NSMenuItem) {
+        guard let dir = sender.representedObject as? String else { return }
+        // Re-copy settings and MCP servers from the default before handing over, so a profile
+        // never drifts. Writes only ever land inside ~/.cookie-monster/profiles.
+        if dir != kClaudeDefaultDir { syncProfile(dir) }
+        guard setActiveProfile(dir) else { return }
+        log("active profile set → \(dir)")
+        refresh()
+        render()
+    }
+
+    @objc func addProfile() {
+        let alert = NSAlert()
+        alert.messageText = "Add a subscription"
+        alert.informativeText = "Creates a profile holding a copy of your settings and MCP servers — only the "
+            + "Claude account differs. Your own config is never modified.\n\n"
+            + "After switching to it, run `claude` once and sign in with the other "
+            + "subscription. Both stay signed in from then on."
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
+        field.placeholderString = "work"
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Create")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        do {
+            _ = try createProfile(name: field.stringValue)   // validates; "." / ".." would escape
+            refresh(); render()
+        } catch {
+            log("createProfile failed: \(error.localizedDescription)")
+            let fail = NSAlert()
+            fail.messageText = "Couldn't create that profile"
+            fail.informativeText = error.localizedDescription
+            fail.alertStyle = .warning
+            NSApp.activate(ignoringOtherApps: true)
+            fail.runModal()
+        }
+    }
+
+    @objc func copyShellSetup() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(kShellSnippet, forType: .string)
+        log("copied shell setup snippet")
+        let alert = NSAlert()
+        alert.messageText = "Shell setup copied"
+        alert.informativeText = "Paste it into ~/.zshrc (or ~/.bashrc), then open a new terminal.\n\n"
+            + "It re-reads the active subscription every time you run `claude`, so switching "
+            + "applies to terminals that are already open.\n\n"
+            + "It only covers `claude` run from a shell. Editor integrations that launch the "
+            + "binary directly keep using your default subscription."
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
     }
 
     @objc func setInterval(_ sender: NSMenuItem) {
