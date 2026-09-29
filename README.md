@@ -116,30 +116,6 @@ All three are in the 🍪 menu and persist across restarts:
   usage, in the native menu-bar text color) or **Vibrant** (the 🍪 emoji with a
   green/orange/red percentage).
 
-## Two Claude subscriptions
-
-Keep both signed in and switch which one `claude` uses, without logging out:
-
-1. 🍪 → **Active Subscription** → **Add Subscription…**, name it (e.g. `work`)
-2. 🍪 → **Active Subscription** → **Copy Shell Setup**, paste into `~/.zshrc`, open a new terminal
-3. Switch to the new profile, run `claude`, and sign in with the second account
-
-From then on, picking a subscription in the menu takes effect on the next `claude`
-— including in terminals that are already open.
-
-A profile is a config directory whose contents are **symlinked** to `~/.claude`,
-so settings, MCP servers, plugins, skills and history are the same files; only the
-account differs. Claude Code keys its keychain entry to the directory path, which
-is what lets both stay signed in.
-
-Two honest limitations:
-
-- **Editor integrations that exec `claude` directly** don't read the shell function,
-  so they keep using your default subscription.
-- **Usage for a non-active profile isn't shown.** Claude Code derives that profile's
-  keychain entry name by an undocumented scheme, so Cookie Monster can't read its
-  token. It shows the profile's account instead of another subscription's numbers.
-
 ## Uninstall
 
 ```bash
