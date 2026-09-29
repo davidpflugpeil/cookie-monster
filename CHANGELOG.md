@@ -4,6 +4,34 @@ All notable changes to Cookie Monster are documented here. The format is based o
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.5.0] — 2026-09-29
+
+### Added
+- **Switch between two Claude subscriptions without logging out.** Keep both signed
+  in permanently and pick the active one from **Active Subscription** in the menu.
+  - A profile is a config directory built as a **symlink farm** over `~/.claude`,
+    plus `.claude.json` pointing at your real `~/.claude.json`. Your settings, MCP
+    servers, plugins, skills, projects and history are *the same files* — only the
+    account differs, because Claude Code keys its keychain entry to the directory
+    path. (Claude Code writes through symlinks, so shared files stay shared.)
+  - **Copy Shell Setup** gives you a one-line shell function for your rc file. It
+    re-reads the active subscription on every `claude` invocation, so switching
+    applies to terminals that are already open — no restart, no logout.
+  - Note: `CLAUDE_CONFIG_DIR` set to `~/.claude` is **not** the same as leaving it
+    unset — it selects a different keychain entry and reads as signed out. The
+    Default profile therefore means *unset*, which the shell function handles.
+  - Locks, pid files and sockets are never shared between profiles. Claude Code
+    takes its config lock with `mkdir()`, which on a symlink can never be acquired
+    *or* broken, leaving the CLI to rewrite the shared `~/.claude.json` unlocked.
+  - The menu warns when the shell function isn't installed, because switching then
+    changes nothing that `claude` will ever see. Editor integrations that exec the
+    binary directly bypass it too, and the setup dialog says so.
+  - Cookie Monster can't read a switched profile's usage — Claude Code derives that
+    keychain entry name by an undocumented scheme — so it shows the profile's
+    identity via `claude auth status` rather than another account's numbers. For
+    the same reason the menu-bar item shows `—` instead of substituting the other
+    subscription's percentage under your Claude pin.
+
 ## [0.4.6] — 2026-09-21
 
 ### Fixed
