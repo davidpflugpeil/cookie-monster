@@ -44,10 +44,10 @@ try? fm.removeItem(atPath: linked)
 try! fm.createSymbolicLink(atPath: linked, withDestinationPath: shared)
 
 let beforeCfg = sha(homeCfg), beforeSettings = sha(homeSettings)
-let p = try! createProfile(name: "work")
+let p = try! createProfile(.claude, name: "work")
 
 // --- the invariants --------------------------------------------------------------------
-check("profile lives under ~/.cookie-monster", "\(p.configDir.hasPrefix(kProfilesDir))", "true")
+check("profile lives under ~/.cookie-monster", "\(p.configDir.hasPrefix(kProfilesRoot))", "true")
 
 var links: [String] = []
 if let e = fm.enumerator(atPath: p.configDir) {
@@ -70,29 +70,71 @@ check("shared file behind the source symlink untouched",
 let pcfg = (p.configDir as NSString).appendingPathComponent(".claude.json")
 let unparsable = #"{"oauthAccount":{"e":"x"},"history":"hi \ud83d there"}"#
 try! unparsable.write(toFile: pcfg, atomically: true, encoding: .utf8)
-syncProfile(p.configDir)
+syncProfile(.claude, p.configDir)
 check("unparsable profile config left intact",
       (try? String(contentsOfFile: pcfg, encoding: .utf8)) ?? "?", unparsable)
 
 // Switching must not destroy files the profile itself owns.
 try! #"{"model":"haiku"}"#.write(toFile: (p.configDir as NSString).appendingPathComponent("settings.json"),
                                  atomically: true, encoding: .utf8)
-syncProfile(p.configDir)
+syncProfile(.claude, p.configDir)
 check("profile-owned settings survive a switch",
       (try? String(contentsOfFile: (p.configDir as NSString).appendingPathComponent("settings.json"),
                    encoding: .utf8)) ?? "?", #"{"model":"haiku"}"#)
 
 // Secrets copied out of a 0600 source must not become world-readable.
 try? fm.removeItem(atPath: pcfg)
-syncProfile(p.configDir)
+syncProfile(.claude, p.configDir)
 let mode = ((try? fm.attributesOfItem(atPath: pcfg))?[.posixPermissions] as? NSNumber)?.intValue ?? -1
 check("profile config is 0600", String(mode, radix: 8), "600")
 
 // Names that would escape the profiles directory.
 for bad in [".", "..", "", "a/b", "Default"] {
-    do { _ = try createProfile(name: bad); check("reject \"\(bad)\"", "created", "threw") }
+    do { _ = try createProfile(.claude, name: bad); check("reject \"\(bad)\"", "created", "threw") }
     catch { check("reject \"\(bad)\"", "threw", "threw") }
 }
+
+// Active profile is tracked per provider, so switching one never moves the other.
+_ = setActiveProfile(.claude, "/nope/missing")
+check("missing dir flagged", "\(activeProfile(.claude).missing)", "true")
+_ = setActiveProfile(.claude, Provider.claude.defaultConfigDir)
+check("default not flagged", "\(activeProfile(.claude).missing)", "false")
+check("codex unaffected by a claude switch",
+      activeProfile(.codex).dir, Provider.codex.defaultConfigDir)
+
+// --- Codex: same design, and its credentials are a plain file so every profile is readable
+let codexDir = (home as NSString).appendingPathComponent(".codex")
+try? fm.createDirectory(atPath: codexDir, withIntermediateDirectories: true)
+try! "[mcp_servers.demo]\ncommand = \"x\"\n"
+    .write(toFile: (codexDir as NSString).appendingPathComponent("config.toml"),
+           atomically: true, encoding: .utf8)
+try! #"{"tokens":{"access_token":"REAL","account_id":"a"}}"#
+    .write(toFile: (codexDir as NSString).appendingPathComponent("auth.json"),
+           atomically: true, encoding: .utf8)
+let beforeCodexAuth = sha((codexDir as NSString).appendingPathComponent("auth.json"))
+
+let cp = try! createProfile(.codex, name: "work")
+check("codex profile is separate from claude's",
+      "\(cp.configDir.hasPrefix(Provider.codex.profilesDir))", "true")
+check("codex config.toml seeded (MCP servers ride along)",
+      "\(fm.fileExists(atPath: (cp.configDir as NSString).appendingPathComponent("config.toml")))", "true")
+check("codex credentials NOT copied into the profile",
+      "\(fm.fileExists(atPath: (cp.configDir as NSString).appendingPathComponent("auth.json")))", "false")
+check("codex sessions (gigabytes) not copied",
+      "\(fm.fileExists(atPath: (cp.configDir as NSString).appendingPathComponent("sessions")))", "false")
+try! #"{"tokens":{"access_token":"PROFILE","account_id":"b"}}"#
+    .write(toFile: (cp.configDir as NSString).appendingPathComponent("auth.json"),
+           atomically: true, encoding: .utf8)
+check("per-profile codex token is readable",
+      readCodexCredentials(dir: cp.configDir)?.accessToken ?? "?", "PROFILE")
+// Compare a digest, never the token itself: an unsandboxed path here once printed the
+// user's real access token into the test log.
+check("default codex token still separate",
+      "\(readCodexCredentials()?.accessToken == "REAL")", "true")
+check("real codex auth.json untouched",
+      sha((codexDir as NSString).appendingPathComponent("auth.json")), beforeCodexAuth)
+check("shell setup covers both CLIs",
+      "\(kShellSnippet.contains("CLAUDE_CONFIG_DIR") && kShellSnippet.contains("CODEX_HOME"))", "true")
 
 // THE ONE THAT MATTERS: the user's own config, byte for byte.
 check("~/.claude.json unchanged", sha(homeCfg), beforeCfg)

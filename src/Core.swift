@@ -9,9 +9,9 @@ import Security
 let kUsageURL = URL(string: "https://api.anthropic.com/api/oauth/usage")!
 let kAccountURL = URL(string: "https://api.anthropic.com/api/oauth/account")!
 let kKeychainService = "Claude Code-credentials"
-let kClaudeConfigPath = (NSHomeDirectory() as NSString).appendingPathComponent(".claude.json")
+let kClaudeConfigPath = (cmHome() as NSString).appendingPathComponent(".claude.json")
 let kCodexUsageURL = URL(string: "https://chatgpt.com/backend-api/codex/usage")!
-let kCodexDir = (NSHomeDirectory() as NSString).appendingPathComponent(".codex")
+let kCodexDir = (cmHome() as NSString).appendingPathComponent(".codex")
 let kCodexAuthPath = (kCodexDir as NSString).appendingPathComponent("auth.json")
 let kLoginPlistLabel = "com.pflugpeil.cookiemonster"
 let kPollInterval: TimeInterval = 300
@@ -54,6 +54,30 @@ enum Provider: String, CaseIterable {
     var signInHint: String {
         self == .claude ? "Open Claude Code and sign in, then Refresh"
                         : "Run `codex` and sign in with ChatGPT, then Refresh"
+    }
+
+    /// The environment variable that points the CLI at a different config directory.
+    /// Setting it selects that directory's own credentials, which is what lets two
+    /// subscriptions stay signed in at once.
+    var configEnvVar: String { self == .claude ? "CLAUDE_CONFIG_DIR" : "CODEX_HOME" }
+    var cliName: String { self == .claude ? "claude" : "codex" }
+    var defaultConfigDir: String {
+        (cmHome() as NSString).appendingPathComponent(self == .claude ? ".claude" : ".codex")
+    }
+    var profilesDir: String { (kProfilesRoot as NSString).appendingPathComponent(rawValue) }
+    var activeProfileFile: String {
+        (kLogDir as NSString).appendingPathComponent("active-profile-" + rawValue)
+    }
+
+    /// Config worth sharing with a new profile. An allowlist, so the gigabytes each CLI
+    /// accumulates (Claude's `projects`, Codex's `sessions`/`archived_sessions`/sqlite) are
+    /// excluded by omission rather than by trying to enumerate them.
+    var profileSeed: [String] {
+        self == .claude
+            ? ["settings.json", "settings.local.json", "CLAUDE.md",
+               "commands", "agents", "hooks", "skills", "plugins"]
+            // Codex keeps its MCP servers in config.toml, so parity is cheap here.
+            : ["config.toml", "hooks.json", "AGENTS.md", "prompts", "skills"]
     }
 }
 
@@ -207,8 +231,9 @@ func codexInstalled() -> Bool { FileManager.default.fileExists(atPath: kCodexDir
 
 /// Reads the ChatGPT OAuth token Codex stores on disk. Read-only: we never
 /// refresh or rewrite `auth.json`, so we can't disturb a running Codex session.
-func readCodexCredentials() -> CodexCredentials? {
-    guard let data = FileManager.default.contents(atPath: kCodexAuthPath),
+func readCodexCredentials(dir: String? = nil) -> CodexCredentials? {
+    let path = dir.map { ($0 as NSString).appendingPathComponent("auth.json") } ?? kCodexAuthPath
+    guard let data = FileManager.default.contents(atPath: path),
           let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
           let tokens = root["tokens"] as? [String: Any],
           let token = tokens["access_token"] as? String, !token.isEmpty else { return nil }
@@ -227,8 +252,8 @@ func cmHome() -> String {
 
 let kClaudeDefaultDir = (cmHome() as NSString).appendingPathComponent(".claude")
 let kClaudeHomeConfig = (cmHome() as NSString).appendingPathComponent(".claude.json")
-let kProfilesDir = (kLogDir as NSString).appendingPathComponent("profiles")
-let kActiveProfileFile = (kLogDir as NSString).appendingPathComponent("active-profile")
+let kProfilesRoot = (kLogDir as NSString).appendingPathComponent("profiles")
+let kLegacyActiveProfileFile = (kLogDir as NSString).appendingPathComponent("active-profile")
 
 /// v1 of this feature symlinked a profile's files to the real ones. That destroyed the
 /// user's config: a profile that isn't signed in yet makes Claude Code initialise a fresh
@@ -244,10 +269,11 @@ let kProfileSeed = [
 /// own settings.json, CLAUDE.md or commands, and overwriting them on every switch silently
 /// destroyed the user's per-profile work. Only mcpServers is pushed on switch.
 
-struct ClaudeProfile {
+struct Profile {
+    let provider: Provider
     let name: String
     let configDir: String
-    var isDefault: Bool { configDir == kClaudeDefaultDir }
+    var isDefault: Bool { configDir == provider.defaultConfigDir }
     /// nil means CLAUDE_CONFIG_DIR is unset — the only way to reach the default profile's
     /// credentials. Setting it to ~/.claude keys a different keychain entry entirely.
     var envConfigDir: String? { isDefault ? nil : configDir }
@@ -277,7 +303,7 @@ private func assertInsideProfiles(_ path: String) -> Bool {
     // paths that already exist, so standardizing an as-yet-uncreated destination against an
     // existing root silently rejects every legitimate copy.
     guard !path.contains("/../"), !path.hasSuffix("/.."), !path.contains("//") else { return false }
-    return (path + "/").hasPrefix(kProfilesDir + "/")
+    return (path + "/").hasPrefix(kProfilesRoot + "/")
 }
 
 /// Copies with symlinks RESOLVED. FileManager.copyItem preserves them, which would put a
@@ -298,7 +324,7 @@ private func replaceCopy(from src: String, to dst: String) {
 /// gets removed rather than left pointing outside the sandbox.
 private func stripSymlinks(under dir: String) {
     let fm = FileManager.default
-    guard assertInsideProfiles(dir) || dir == kProfilesDir,
+    guard assertInsideProfiles(dir) || dir == kProfilesRoot,
           let e = fm.enumerator(atPath: dir) else { return }
     for case let rel as String in e {
         let full = (dir as NSString).appendingPathComponent(rel)
@@ -309,14 +335,15 @@ private func stripSymlinks(under dir: String) {
     }
 }
 
-func listProfiles() -> [ClaudeProfile] {
-    var out = [ClaudeProfile(name: "Default", configDir: kClaudeDefaultDir)]
-    for name in ((try? FileManager.default.contentsOfDirectory(atPath: kProfilesDir)) ?? []).sorted()
+func listProfiles(_ provider: Provider) -> [Profile] {
+    var out = [Profile(provider: provider, name: "Default", configDir: provider.defaultConfigDir)]
+    let root = provider.profilesDir
+    for name in ((try? FileManager.default.contentsOfDirectory(atPath: root)) ?? []).sorted()
     where !name.hasPrefix(".") {
-        let dir = (kProfilesDir as NSString).appendingPathComponent(name)
+        let dir = (root as NSString).appendingPathComponent(name)
         var isDir: ObjCBool = false
         guard FileManager.default.fileExists(atPath: dir, isDirectory: &isDir), isDir.boolValue else { continue }
-        out.append(ClaudeProfile(name: name, configDir: dir))
+        out.append(Profile(provider: provider, name: name, configDir: dir))
     }
     return out
 }
@@ -324,51 +351,82 @@ func listProfiles() -> [ClaudeProfile] {
 /// The configured profile and whether its directory still exists. Callers must not quietly
 /// fall back to the default: the shell function doesn't, so the app would report one account
 /// while every terminal keeps using another.
-func activeProfile() -> (dir: String, missing: Bool) {
-    guard let raw = try? String(contentsOfFile: kActiveProfileFile, encoding: .utf8) else {
-        return (kClaudeDefaultDir, false)
+func activeProfile(_ provider: Provider) -> (dir: String, missing: Bool) {
+    guard let raw = try? String(contentsOfFile: provider.activeProfileFile, encoding: .utf8) else {
+        return (provider.defaultConfigDir, false)
     }
     let dir = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-    if dir.isEmpty || dir == kClaudeDefaultDir { return (kClaudeDefaultDir, false) }
+    if dir.isEmpty || dir == provider.defaultConfigDir { return (provider.defaultConfigDir, false) }
     return (dir, !FileManager.default.fileExists(atPath: dir))
 }
 
-func activeProfileDir() -> String { activeProfile().dir }
+func activeProfileDir(_ provider: Provider) -> String { activeProfile(provider).dir }
 
 @discardableResult
-func setActiveProfile(_ configDir: String) -> Bool {
+func setActiveProfile(_ provider: Provider, _ configDir: String) -> Bool {
     try? FileManager.default.createDirectory(atPath: kLogDir, withIntermediateDirectories: true)
-    do { try (configDir + "\n").write(toFile: kActiveProfileFile, atomically: true, encoding: .utf8); return true }
-    catch { log("could not write active-profile"); return false }
+    do {
+        try (configDir + "\n").write(toFile: provider.activeProfileFile, atomically: true, encoding: .utf8)
+        return true
+    } catch { log("could not write active-profile for \(provider.rawValue)"); return false }
 }
 
-/// Copies the default profile's config into `dir`, and merges the current `mcpServers` into
-/// the profile's own .claude.json — never the other way round. `projects` (gigabytes of
-/// history) is deliberately not copied.
-func syncProfile(_ dir: String, seeding: Bool = false) {
+/// 0.5.0-era layout put Claude profiles directly under profiles/ with a single
+/// active-profile file. Move them under profiles/claude/ so Codex can have its own.
+func migrateProfileLayout() {
+    let fm = FileManager.default
+    guard fm.fileExists(atPath: kProfilesRoot) else { return }
+    let known = Set(Provider.allCases.map { $0.rawValue })
+    for name in (try? fm.contentsOfDirectory(atPath: kProfilesRoot)) ?? [] {
+        guard !known.contains(name), !name.hasPrefix(".") else { continue }
+        let from = (kProfilesRoot as NSString).appendingPathComponent(name)
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: from, isDirectory: &isDir), isDir.boolValue else { continue }
+        try? fm.createDirectory(atPath: Provider.claude.profilesDir, withIntermediateDirectories: true)
+        let to = (Provider.claude.profilesDir as NSString).appendingPathComponent(name)
+        guard !fm.fileExists(atPath: to), (try? fm.moveItem(atPath: from, toPath: to)) != nil else { continue }
+        log("migrated profile \(name) into profiles/claude")
+        // The active-profile file stores an absolute path, so it has to follow.
+        if let old = try? String(contentsOfFile: kLegacyActiveProfileFile, encoding: .utf8),
+           old.trimmingCharacters(in: .whitespacesAndNewlines) == from {
+            setActiveProfile(.claude, to)
+        }
+    }
+    if let old = try? String(contentsOfFile: kLegacyActiveProfileFile, encoding: .utf8) {
+        let dir = old.trimmingCharacters(in: .whitespacesAndNewlines)
+        if dir == Provider.claude.defaultConfigDir { setActiveProfile(.claude, dir) }
+        try? fm.removeItem(atPath: kLegacyActiveProfileFile)
+    }
+}
+
+/// Copies the provider's default config into `dir`. Nothing is ever written outside
+/// kProfilesRoot, and `sessions`/`projects` (gigabytes of history) are never copied.
+func syncProfile(_ provider: Provider, _ dir: String, seeding: Bool = false) {
     let fm = FileManager.default
     guard assertInsideProfiles(dir) else { return }
     try? fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
     try? fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir)
 
     if seeding {
-        for entry in kProfileSeed {
+        for entry in provider.profileSeed {
             let dst = (dir as NSString).appendingPathComponent(entry)
             if fm.fileExists(atPath: dst) { continue }   // never clobber what the profile owns
-            replaceCopy(from: (kClaudeDefaultDir as NSString).appendingPathComponent(entry), to: dst)
+            replaceCopy(from: (provider.defaultConfigDir as NSString).appendingPathComponent(entry),
+                        to: dst)
         }
         stripSymlinks(under: dir)
     }
+    guard provider == .claude else { return }   // Codex's MCP servers live in the copied config.toml
 
-    // The profile owns its .claude.json outright — we only push MCP servers into it, so a
-    // fresh-init write by a signed-out Claude Code can never reach the real file.
+    // Claude keeps MCP servers in ~/.claude.json. The profile owns its copy outright; we only
+    // push mcpServers into it, so a fresh-init write by a signed-out CLI can never reach the
+    // real file.
     let target = (dir as NSString).appendingPathComponent(".claude.json")
     var profileCfg: [String: Any] = [:]
     if fm.fileExists(atPath: target) {
         // Present but unreadable means DO NOT TOUCH. Writing a config derived from a failed
-        // read is exactly how v1 destroyed 104 KB of config. Note Claude Code writes JSON via
-        // Node, which emits unpaired surrogate escapes that JSONSerialization rejects — so a
-        // single emoji in that profile's history would otherwise wipe it.
+        // read is exactly how v1 destroyed 104 KB of config. Claude Code writes JSON via
+        // Node, which emits unpaired surrogate escapes that JSONSerialization rejects.
         guard let d = fm.contents(atPath: target),
               let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else {
             log("profile config unreadable; leaving it alone")
@@ -384,39 +442,52 @@ func syncProfile(_ dir: String, seeding: Bool = false) {
           let out = try? JSONSerialization.data(withJSONObject: profileCfg, options: [.prettyPrinted])
     else { return }
     try? out.write(to: URL(fileURLWithPath: target), options: .atomic)
-    // #9: the source is 0600 and may carry MCP credentials; .atomic writes 0644 by default.
+    // The source is 0600 and may carry MCP credentials; .atomic writes 0644 by default.
     try? fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: target)
 }
 
 /// v0.5.0 built profiles as symlink farms. Those still on disk write straight through into
-/// the real ~/.claude, so they must be neutralised before a profile is ever used.
+/// the real config dir, so they must be neutralised before a profile is ever used.
 func migrateLegacyProfiles() {
-    let fm = FileManager.default
-    for name in (try? fm.contentsOfDirectory(atPath: kProfilesDir)) ?? [] {
-        let dir = (kProfilesDir as NSString).appendingPathComponent(name)
-        stripSymlinks(under: dir)
+    for provider in Provider.allCases {
+        for name in (try? FileManager.default.contentsOfDirectory(atPath: provider.profilesDir)) ?? [] {
+            stripSymlinks(under: (provider.profilesDir as NSString).appendingPathComponent(name))
+        }
     }
 }
 
-func createProfile(name rawName: String) throws -> ClaudeProfile {
+func createProfile(_ provider: Provider, name rawName: String) throws -> Profile {
     let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
     guard isValidProfileName(name) else {
         throw NSError(domain: "CookieMonster", code: 1, userInfo: [
             NSLocalizedDescriptionKey: "Use letters, numbers, spaces, - or _ (not \"Default\")."])
     }
-    let dir = (kProfilesDir as NSString).appendingPathComponent(name)
-    syncProfile(dir, seeding: true)
-    log("created profile \(name)")
-    return ClaudeProfile(name: name, configDir: dir)
+    try FileManager.default.createDirectory(atPath: provider.profilesDir, withIntermediateDirectories: true)
+    let dir = (provider.profilesDir as NSString).appendingPathComponent(name)
+    syncProfile(provider, dir, seeding: true)
+    log("created \(provider.rawValue) profile \(name)")
+    return Profile(provider: provider, name: name, configDir: dir)
 }
 
+/// Functions, not exports: they re-read the active profile on every invocation, so switching
+/// applies to terminals that are already open. The default profile means the variable stays
+/// UNSET — setting CLAUDE_CONFIG_DIR to ~/.claude selects a different keychain entry entirely.
 let kShellSnippet = """
 claude() {
-  local p; p="$(cat ~/.cookie-monster/active-profile 2>/dev/null)"
+  local p; p="$(cat ~/.cookie-monster/active-profile-claude 2>/dev/null)"
   if [ -n "$p" ] && [ "$p" != "$HOME/.claude" ]; then
     CLAUDE_CONFIG_DIR="$p" command claude "$@"
   else
     command claude "$@"
+  fi
+}
+
+codex() {
+  local p; p="$(cat ~/.cookie-monster/active-profile-codex 2>/dev/null)"
+  if [ -n "$p" ] && [ "$p" != "$HOME/.codex" ]; then
+    CODEX_HOME="$p" command codex "$@"
+  else
+    command codex "$@"
   fi
 }
 """
@@ -454,38 +525,41 @@ func runBounded(_ executable: String, _ args: [String], env: [String: String]?,
 }
 
 private let cliPathLock = NSLock()
-private var cachedCLIPath: String?
-private var cliPathCheckedAt: Date?
+private var cachedCLIPaths: [String: String] = [:]
+private var cliPathCheckedAt: [String: Date] = [:]
 
-func claudeCLIPath() -> String? {
+/// Locates a provider's CLI. npm/nvm installs live only on the user's PATH, so fall back to
+/// an INTERACTIVE login shell (-i): zsh and bash source ~/.zshrc / ~/.bashrc only for those.
+func cliPath(_ provider: Provider) -> String? {
     cliPathLock.lock(); defer { cliPathLock.unlock() }
-    if let hit = cachedCLIPath {
+    let name = provider.cliName
+    if let hit = cachedCLIPaths[name] {
         if FileManager.default.isExecutableFile(atPath: hit) { return hit }
-        cachedCLIPath = nil; cliPathCheckedAt = nil     // e.g. the nvm version it lived in went away
+        cachedCLIPaths[name] = nil; cliPathCheckedAt[name] = nil
     }
-    // Never cache a miss for the process lifetime: the user may install the CLI, or fix
-    // their PATH, while the app is running.
-    if let checked = cliPathCheckedAt, Date().timeIntervalSince(checked) < 300 { return nil }
+    // Never cache a miss for the process lifetime: the user may install the CLI while we run.
+    if let at = cliPathCheckedAt[name], Date().timeIntervalSince(at) < 300 { return nil }
     let home = cmHome() as NSString
-    let candidates = [
-        home.appendingPathComponent(".local/bin/claude"), "/opt/homebrew/bin/claude",
-        "/usr/local/bin/claude", home.appendingPathComponent(".bun/bin/claude"),
-        home.appendingPathComponent(".npm-global/bin/claude"),
+    var candidates = [
+        home.appendingPathComponent(".local/bin/" + name), "/opt/homebrew/bin/" + name,
+        "/usr/local/bin/" + name, home.appendingPathComponent(".bun/bin/" + name),
+        home.appendingPathComponent(".npm-global/bin/" + name),
     ]
+    if provider == .codex { candidates.append("/Applications/ChatGPT.app/Contents/Resources/codex") }
     var found = candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
-    if found == nil { found = whichClaudeViaLoginShell() }
-    cliPathCheckedAt = Date()
-    cachedCLIPath = found
+    if found == nil { found = whichViaLoginShell(name) }
+    cliPathCheckedAt[name] = Date()
+    cachedCLIPaths[name] = found
     return found
 }
 
-private func whichClaudeViaLoginShell() -> String? {
+func claudeCLIPath() -> String? { cliPath(.claude) }
+
+private func whichViaLoginShell(_ name: String) -> String? {
     let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
-    // -i matters: zsh/bash source ~/.zshrc / ~/.bashrc only for *interactive* shells, which
-    // is exactly where nvm and npm-prefix installs put their PATH. `unset -f claude` matters
-    // too: once our own shell function is installed, `command -v claude` answers with the
-    // function name rather than a path.
-    guard let data = runBounded(shell, ["-ilc", "unset -f claude 2>/dev/null; command -v claude"],
+    // `unset -f` matters: once our own shell function is installed, `command -v` answers with
+    // the function name rather than a path.
+    guard let data = runBounded(shell, ["-ilc", "unset -f \(name) 2>/dev/null; command -v \(name)"],
                                 env: nil, timeout: 10),
           let text = String(data: data, encoding: .utf8) else { return nil }
     let path = text.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }
@@ -519,11 +593,11 @@ func claudeAuthStatus(configDir: String?, timeout: TimeInterval = 15) -> AuthSta
                       orgName: root["orgName"] as? String)
 }
 
-/// Without the shell function installed, switching changes nothing `claude` will ever see.
+/// Without the shell functions installed, switching changes nothing the CLIs will ever see.
 func shellSnippetInstalled() -> Bool {
     for rc in ["/.zshrc", "/.zprofile", "/.bashrc", "/.bash_profile", "/.profile"] {
         if let text = try? String(contentsOfFile: cmHome() + rc, encoding: .utf8),
-           text.contains("cookie-monster/active-profile") { return true }
+           text.contains("cookie-monster/active-profile-") { return true }
     }
     return false
 }

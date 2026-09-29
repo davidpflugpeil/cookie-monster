@@ -7,9 +7,19 @@ All notable changes to Cookie Monster are documented here. The format is based o
 ## [Unreleased] — branch `profile-switch-v2`
 
 ### Added
-- **An account switcher at the top of the Claude card.** Every subscription is listed
-  with the value of your pinned metric for *that* account, the active one marked;
-  click a row to switch. All profiles are polled, not just the active one, so the
+- **Codex gets the same treatment.** `CODEX_HOME` is Codex's equivalent of
+  `CLAUDE_CONFIG_DIR`, so a Codex profile works identically — and more simply:
+  Codex keeps credentials in a plain `auth.json` inside its config dir, so every
+  profile's usage is readable with no keychain lookup at all. Seeding copies
+  `config.toml` (where Codex's MCP servers live), `hooks.json`, `AGENTS.md`,
+  `prompts` and `skills`; `sessions` (1.4 GB here), `archived_sessions` and the
+  sqlite stores are never copied.
+- The shell setup now installs a function for **both** `claude` and `codex`, each
+  reading its own active-profile file, so the two switch independently.
+- **An account switcher at the top of each provider's card.** Every subscription is
+  listed with the value of your pinned metric for *that* account, the active one
+  marked; click a row to switch. Switching does not dismiss the menu, so you can
+  compare accounts in place. All profiles are polled, not just the active one, so the
   numbers are live for each. Each account has its own rate-limit budget, and a 429
   backs off per profile rather than for Claude as a whole.
 - **Switch between two Claude subscriptions without logging out.** Keep both signed
