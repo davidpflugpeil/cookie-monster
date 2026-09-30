@@ -4,6 +4,21 @@ All notable changes to Cookie Monster are documented here. The format is based o
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.5.1] — 2026-09-30
+
+### Fixed
+- **The app was burning your account's rate-limit quota and taking your own CLI
+  sessions down with it.** A `401` set no backoff, so a profile whose token had
+  expired was re-polled every interval forever — about 720 pointless requests a
+  day against an endpoint whose hourly quota is shared with Claude Code itself.
+  A 401 can only be resolved by a human signing in, so it now backs off 30
+  minutes, doubling to a 4-hour cap, and the affected profile is parked for an
+  hour.
+- **Inactive profiles are polled at most every 15 minutes.** They only feed the
+  account switcher, so they never needed the active profile's freshness — but
+  polling them on the same schedule doubled the request rate the moment you added
+  a second subscription.
+
 ## [0.5.0] — 2026-09-29
 
 ### Added

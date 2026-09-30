@@ -15,9 +15,13 @@ let kCodexDir = (cmHome() as NSString).appendingPathComponent(".codex")
 let kCodexAuthPath = (kCodexDir as NSString).appendingPathComponent("auth.json")
 let kLoginPlistLabel = "com.pflugpeil.cookiemonster"
 let kPollInterval: TimeInterval = 300
+/// Inactive profiles only feed the switcher; they don't need the active one's freshness.
+let kInactiveProfileInterval: TimeInterval = 900
+/// A 401 can only be fixed by a human signing in, so stop asking for a while.
+let kSignedOutBackoff: TimeInterval = 3600
 let kLogDir = (cmHome() as NSString).appendingPathComponent(".cookie-monster")
 let kLogFile = (kLogDir as NSString).appendingPathComponent("cookie-monster.log")
-let kVersion = "0.5.0"
+let kVersion = "0.5.1"
 
 // MARK: - Logging (no secrets ever pass through here)
 

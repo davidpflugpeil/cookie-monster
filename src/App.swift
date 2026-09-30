@@ -108,6 +108,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var discoveryAttempted: Set<String> = [] // one keychain search per profile per launch
     var profileUsage: [String: ProviderUsage] = [:]   // usage per profile, for the switcher
     var profileBlocked: [String: Date] = [:]          // per-profile 429 backoff
+    var profileFetchedAt: [String: Date] = [:]        // throttles inactive profiles
 
     /// A monochrome gauge drawn as a template image (so macOS tints it to the menu
     /// bar). The needle reflects `percent`, so it agrees with the number beside it.
@@ -234,7 +235,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func fetchProfileUsage(_ prof: Profile, isActive: Bool, generation: Int) {
         if let until = profileBlocked[prof.configDir], Date() < until { return }
         if isActive, isBlocked(.claude) { return }
+        // An inactive profile only feeds the switcher, so it does not need the active
+        // profile's freshness — and these endpoints rate-limit on roughly an hourly quota
+        // that is shared with the user's own CLI sessions.
+        if !isActive, let last = profileFetchedAt[prof.configDir],
+           Date().timeIntervalSince(last) < kInactiveProfileInterval { return }
         let dir = prof.configDir
+        profileFetchedAt[dir] = Date()
         DispatchQueue.global(qos: .utility).async {
             let service = prof.isDefault ? kKeychainService : recordedKeychainService(dir)
             guard let service = service, let creds = readCredentials(service: service) else {
@@ -256,8 +263,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 fetchClaudeUsage(creds: creds, email: email) { result in
                     DispatchQueue.main.async {
                         switch result {
-                        case .ok(let u): self.profileUsage[dir] = u
-                        case .rateLimited(let until): self.profileBlocked[dir] = until
+                        case .ok(let u):
+                            self.profileUsage[dir] = u
+                        case .rateLimited(let until):
+                            self.profileBlocked[dir] = until
+                        case .needsAuth:
+                            // Dead until someone signs this profile in again.
+                            self.profileBlocked[dir] = Date().addingTimeInterval(kSignedOutBackoff)
+                            log("profile \(prof.name) signed out → not retrying for 1h")
                         default: break
                         }
                         if isActive { self.set(.claude, result, generation: generation) }
@@ -337,6 +350,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let isActive = prof.configDir == active.dir
             if let until = profileBlocked[prof.configDir], Date() < until { continue }
             if isActive, isBlocked(.codex) { continue }
+            if !isActive, let last = profileFetchedAt[prof.configDir],
+               Date().timeIntervalSince(last) < kInactiveProfileInterval { continue }
+            profileFetchedAt[prof.configDir] = Date()
             // Codex stores credentials in auth.json inside its config dir, so every profile's
             // token is directly readable — no keychain discovery needed.
             guard let creds = readCodexCredentials(dir: prof.isDefault ? nil : prof.configDir) else {
@@ -353,6 +369,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     switch result {
                     case .ok(let u): self.profileUsage[dir] = u
                     case .rateLimited(let until): self.profileBlocked[dir] = until
+                    case .needsAuth:
+                        self.profileBlocked[dir] = Date().addingTimeInterval(kSignedOutBackoff)
                     default: break
                     }
                     if isActive { self.set(.codex, result) }
@@ -381,7 +399,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 let wait = min(Prefs.interval * pow(2, Double(min(n, 5))), 1800)
                 self.nextAllowed[p] = Date().addingTimeInterval(wait)
                 log("\(p.rawValue) error #\(n) → retry in \(Int(wait))s")
-            case .needsAuth, .notConfigured, .loading, .otherProfile:
+            case .needsAuth:
+                // Re-sending a dead token achieves nothing and spends the account's quota,
+                // which is shared with the user's actual CLI sessions. Only a human signing
+                // in fixes this, so back off hard and escalate.
+                let n = (self.failures[p] ?? 0) + 1
+                self.failures[p] = n
+                let wait = min(1800 * pow(2, Double(min(n - 1, 3))), 14400)   // 30m → 4h
+                self.nextAllowed[p] = Date().addingTimeInterval(wait)
+                log("\(p.rawValue) needs sign-in → not retrying for \(Int(wait / 60))m")
+            case .notConfigured, .loading, .otherProfile:
                 self.nextAllowed[p] = nil
             }
             self.states[p] = s
