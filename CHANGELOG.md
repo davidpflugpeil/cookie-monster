@@ -4,6 +4,15 @@ All notable changes to Cookie Monster are documented here. The format is based o
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.5.3] — 2026-09-30
+
+### Added
+- **Install Shell Setup** writes the `claude` and `codex` functions into your rc
+  file directly — idempotent, and it backs the file up first. Previously the app
+  only copied the text to the clipboard, and the obvious way to apply it
+  (`pbpaste >> ~/.zshrc`) appends *whatever happens to be on the clipboard*. In
+  testing that appended an image URL and broke the shell on next start.
+
 ## [0.5.2] — 2026-09-30
 
 ### Fixed

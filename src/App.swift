@@ -590,7 +590,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(.separator())
             disabled(menu, "⚠︎ Shell setup not installed", bold: true)
             disabled(menu, "Switching won't affect `claude`, and signing in will overwrite", bold: false)
-            disabled(menu, "your default profile. Use Copy Shell Setup.", bold: false)
+            disabled(menu, "your default profile. Use Install Shell Setup.", bold: false)
         }
         menu.addItem(.separator())
         menu.addItem(item("Refresh Now", #selector(refreshClicked), "r"))
@@ -751,8 +751,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let add = item("Add Subscription…", #selector(addProfile(_:)), "")
         add.representedObject = provider.rawValue
         sub.addItem(add)
-        sub.addItem(item(shellSnippetInstalled() ? "Copy Shell Setup" : "Copy Shell Setup (required)",
-                         #selector(copyShellSetup), ""))
+        sub.addItem(item(shellSnippetInstalled() ? "Shell Setup (installed)" : "Install Shell Setup…",
+                         #selector(installShellSetup), ""))
         let parent = NSMenuItem(title: "\(provider.label) Subscription", action: nil, keyEquivalent: "")
         parent.submenu = sub
         return parent
@@ -903,6 +903,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             NSApp.activate(ignoringOtherApps: true)
             fail.runModal()
         }
+    }
+
+    @objc func installShellSetup() {
+        if shellSnippetInstalled() {
+            copyShellSetup(); return          // already in place — just hand over the text
+        }
+        let confirm = NSAlert()
+        confirm.messageText = "Add the shell functions to your shell config?"
+        confirm.informativeText = "This appends two functions (`claude` and `codex`) to your "
+            + "rc file so switching subscriptions affects the command line. Your current file "
+            + "is backed up first.\n\nWithout them, switching only changes this menu — and "
+            + "signing in writes to your default profile whichever one you selected."
+        confirm.addButton(withTitle: "Install")
+        confirm.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        guard confirm.runModal() == .alertFirstButtonReturn else { return }
+
+        let result = installShellSnippet()
+        log("shell setup install: \(result.ok ? "ok" : "failed")")
+        let done = NSAlert()
+        done.messageText = result.ok ? "Shell setup installed" : "Couldn't install shell setup"
+        done.informativeText = result.message
+        done.alertStyle = result.ok ? .informational : .warning
+        NSApp.activate(ignoringOtherApps: true)
+        done.runModal()
+        render()
     }
 
     @objc func copyShellSetup() {

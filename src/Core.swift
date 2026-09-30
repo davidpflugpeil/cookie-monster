@@ -21,7 +21,7 @@ let kInactiveProfileInterval: TimeInterval = 900
 let kSignedOutBackoff: TimeInterval = 3600
 let kLogDir = (cmHome() as NSString).appendingPathComponent(".cookie-monster")
 let kLogFile = (kLogDir as NSString).appendingPathComponent("cookie-monster.log")
-let kVersion = "0.5.2"
+let kVersion = "0.5.3"
 
 // MARK: - Logging (no secrets ever pass through here)
 
@@ -610,6 +610,36 @@ func signInCommand(_ provider: Provider, profileDir: String) -> String {
         return "env -u \(provider.configEnvVar) \(cli) \(verb)"
     }
     return "\(provider.configEnvVar)=\"\(profileDir)\" \(cli) \(verb)"
+}
+
+/// Writes the shell functions into the user's rc file. Telling people to run
+/// `pbpaste >> ~/.zshrc` appends whatever happens to be on the clipboard to their shell
+/// config — which, in testing, appended an image URL and broke their shell. Do it properly:
+/// idempotent, backed up, and syntax-safe.
+func installShellSnippet() -> (ok: Bool, message: String) {
+    let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
+    let rcName = shell.hasSuffix("bash") ? "/.bashrc" : "/.zshrc"
+    let rc = cmHome() + rcName
+    let existing = (try? String(contentsOfFile: rc, encoding: .utf8)) ?? ""
+    if existing.contains("cookie-monster/active-profile-") {
+        return (true, "Already installed in \(rcName). Open a new terminal to pick it up.")
+    }
+    if !existing.isEmpty {
+        let backup = rc + ".bak-cookie-monster"
+        try? FileManager.default.removeItem(atPath: backup)
+        try? FileManager.default.copyItem(atPath: rc, toPath: backup)
+    }
+    let header = "\n# Cookie Monster — switch Claude/Codex subscriptions from the menu bar.\n"
+    let body = existing.isEmpty ? header + kShellSnippet
+                                : existing.trimmingCharacters(in: .newlines) + "\n" + header + kShellSnippet
+    do {
+        try body.write(toFile: rc, atomically: true, encoding: .utf8)
+        return (true, "Installed in \(rcName)"
+            + (existing.isEmpty ? "" : " (previous version saved as \(rcName).bak-cookie-monster)")
+            + ".\n\nOpen a new terminal, or run `exec $SHELL`, to pick it up.")
+    } catch {
+        return (false, "Couldn't write \(rcName): \(error.localizedDescription)")
+    }
 }
 
 /// Without the shell functions installed, switching changes nothing the CLIs will ever see.
