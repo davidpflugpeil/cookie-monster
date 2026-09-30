@@ -4,6 +4,28 @@ All notable changes to Cookie Monster are documented here. The format is based o
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.5.2] — 2026-09-30
+
+### Fixed
+- **Signing in could silently overwrite the wrong profile.** Without the shell
+  functions installed, `CLAUDE_CONFIG_DIR` is never set, so `claude /login` always
+  writes to the **default** profile — no matter which one you picked in the menu.
+  Selecting a profile and signing in therefore replaced your default account's
+  credentials while leaving the selected profile still signed out, which is how
+  accounts ended up swapped between labels.
+  - **Copy Sign-in Command…** now gives the exact command for a specific profile
+    (`CLAUDE_CONFIG_DIR="…" claude /login`, or `env -u CLAUDE_CONFIG_DIR …` for the
+    default), so a login cannot land anywhere else.
+  - The missing-shell-setup warning moved out of the submenu onto the menu itself,
+    and says what actually goes wrong.
+- **A profile keeps the account you assigned it.** The keychain entry was pinned
+  permanently, but signing in again makes Claude Code write a *new* entry — so the
+  pinned one went stale and returned `401` forever. A profile is now bound to an
+  account identity (written once, never silently rewritten) while the keychain
+  entry is treated as a refreshable cache: a 401 drops it and searches again,
+  matching on the bound account. A profile signed in as someone else is labelled
+  as such rather than quietly relabelled.
+
 ## [0.5.1] — 2026-09-30
 
 ### Fixed

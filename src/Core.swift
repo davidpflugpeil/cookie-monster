@@ -21,7 +21,7 @@ let kInactiveProfileInterval: TimeInterval = 900
 let kSignedOutBackoff: TimeInterval = 3600
 let kLogDir = (cmHome() as NSString).appendingPathComponent(".cookie-monster")
 let kLogFile = (kLogDir as NSString).appendingPathComponent("cookie-monster.log")
-let kVersion = "0.5.1"
+let kVersion = "0.5.2"
 
 // MARK: - Logging (no secrets ever pass through here)
 
@@ -597,6 +597,21 @@ func claudeAuthStatus(configDir: String?, timeout: TimeInterval = 15) -> AuthSta
                       orgName: root["orgName"] as? String)
 }
 
+/// The exact command that signs a *specific* profile in. Without this, `claude /login` goes
+/// to whatever CLAUDE_CONFIG_DIR happens to be — which, with no shell function installed, is
+/// always the default profile. That silently overwrites the default account's credentials
+/// while leaving the profile the user selected still signed out.
+func signInCommand(_ provider: Provider, profileDir: String) -> String {
+    let cli = provider.cliName
+    let verb = provider == .claude ? "/login" : "login"
+    if profileDir == provider.defaultConfigDir {
+        // The default profile is reached by leaving the variable UNSET; setting it to
+        // ~/.claude selects a different keychain entry entirely.
+        return "env -u \(provider.configEnvVar) \(cli) \(verb)"
+    }
+    return "\(provider.configEnvVar)=\"\(profileDir)\" \(cli) \(verb)"
+}
+
 /// Without the shell functions installed, switching changes nothing the CLIs will ever see.
 func shellSnippetInstalled() -> Bool {
     for rc in ["/.zshrc", "/.zprofile", "/.bashrc", "/.bash_profile", "/.profile"] {
@@ -632,41 +647,68 @@ private func serviceRecordPath(_ profileDir: String) -> String {
     (profileDir as NSString).appendingPathComponent(".cookie-monster-keychain")
 }
 
-/// The service name we previously verified for this profile, if any.
+private func accountRecordPath(_ profileDir: String) -> String {
+    (profileDir as NSString).appendingPathComponent(".cookie-monster-account")
+}
+
+/// The account a profile is *meant* to be. Written once, when the profile is first seen
+/// signed in, and never silently changed: the label the user assigned has to keep meaning
+/// the same subscription even after they sign in again.
+func boundAccount(_ profileDir: String) -> String? {
+    guard let s = try? String(contentsOfFile: accountRecordPath(profileDir), encoding: .utf8) else { return nil }
+    let e = s.trimmingCharacters(in: .whitespacesAndNewlines)
+    return e.isEmpty ? nil : e
+}
+
+@discardableResult
+func bindAccount(_ profileDir: String, email: String) -> Bool {
+    guard boundAccount(profileDir) == nil, !email.isEmpty else { return false }
+    try? email.write(toFile: accountRecordPath(profileDir), atomically: true, encoding: .utf8)
+    log("profile \((profileDir as NSString).lastPathComponent) bound to \(email)")
+    return true
+}
+
+/// The keychain entry we last used for this profile. A CACHE, not an identity: signing in
+/// again makes Claude Code write a brand-new entry, so a pinned name goes stale and returns
+/// 401 forever — which is exactly what it did.
 func recordedKeychainService(_ profileDir: String) -> String? {
     guard let s = try? String(contentsOfFile: serviceRecordPath(profileDir), encoding: .utf8) else { return nil }
     let name = s.trimmingCharacters(in: .whitespacesAndNewlines)
     return name.isEmpty ? nil : name
 }
 
-/// Finds and verifies the keychain entry for a profile. Verification matters: picking the
-/// wrong entry would show one subscription's usage under another's name, which is the exact
-/// bug class this app has been bitten by repeatedly. Costs one keychain prompt the first
-/// time (click "Always Allow"), then never searches again.
+/// Drops the cached entry so the next lookup searches again. Called when it stops working.
+func clearKeychainRecord(_ profileDir: String) {
+    guard assertInsideProfiles(profileDir) else { return }
+    try? FileManager.default.removeItem(atPath: serviceRecordPath(profileDir))
+    log("profile \((profileDir as NSString).lastPathComponent): cached keychain entry cleared")
+}
+
+/// Finds and verifies the keychain entry for a profile. Verification is the whole point:
+/// the entry must belong to the account this profile is bound to, or the app would show one
+/// subscription's usage under another's label — and signing in again creates a new entry, so
+/// this has to be re-runnable rather than pinned once.
 func discoverKeychainService(profileDir: String, expectedEmail: String?,
                              verify: (Credentials, @escaping (String?) -> Void) -> Void) -> String? {
-    if let recorded = recordedKeychainService(profileDir) { return recorded }
     guard let expected = expectedEmail else { return nil }
-    let created = ((try? FileManager.default.attributesOfItem(atPath: profileDir))?[.creationDate] as? Date)
-        ?? .distantPast
-    // Only entries created at or after the profile existed can belong to it. Newest first:
-    // the right one is almost always the entry written when the user signed the profile in.
-    let candidates = claudeCredentialServices().filter { $0.created >= created }.prefix(3)
-    for candidate in candidates {
+    // Newest first: the right entry is the one written when the profile was last signed in.
+    // Not filtered by the profile's creation date any more — a re-login can happen at any
+    // time, and the old filter is why a stale entry stayed pinned.
+    for candidate in claudeCredentialServices().prefix(6) {
         guard let creds = readCredentials(service: candidate.service) else { continue }
         let sem = DispatchSemaphore(value: 0)
         var found: String?
         verify(creds) { found = $0; sem.signal() }
         _ = sem.wait(timeout: .now() + 20)
         guard let email = found else { continue }
-        if email.caseInsensitiveCompare(expected) == .orderedSame {
-            try? candidate.service.write(toFile: serviceRecordPath(profileDir),
-                                         atomically: true, encoding: .utf8)
-            log("profile keychain entry identified for \((profileDir as NSString).lastPathComponent)")
-            return candidate.service
-        }
+        guard email.caseInsensitiveCompare(expected) == .orderedSame else { continue }
+        guard assertInsideProfiles(profileDir) else { return nil }
+        try? candidate.service.write(toFile: serviceRecordPath(profileDir),
+                                     atomically: true, encoding: .utf8)
+        log("profile \((profileDir as NSString).lastPathComponent): keychain entry for \(email) found")
+        return candidate.service
     }
-    log("could not identify a keychain entry for \((profileDir as NSString).lastPathComponent)")
+    log("profile \((profileDir as NSString).lastPathComponent): no keychain entry matches \(expected)")
     return nil
 }
 

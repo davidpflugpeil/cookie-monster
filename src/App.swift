@@ -190,6 +190,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             for p in profiles {
                 if let a = claudeAuthStatus(configDir: p.envConfigDir) { found[p.configDir] = a }
             }
+            for (dir, auth) in found {
+                // The label the user assigned must keep meaning the same subscription, so
+                // bind once and never rewrite. A later mismatch is surfaced, not absorbed.
+                if let email = auth.email, auth.loggedIn, dir != Provider.claude.defaultConfigDir {
+                    bindAccount(dir, email: email)
+                }
+            }
             DispatchQueue.main.async { self.profileAuth = found; self.render() }
         }
     }
@@ -268,9 +275,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         case .rateLimited(let until):
                             self.profileBlocked[dir] = until
                         case .needsAuth:
-                            // Dead until someone signs this profile in again.
-                            self.profileBlocked[dir] = Date().addingTimeInterval(kSignedOutBackoff)
-                            log("profile \(prof.name) signed out → not retrying for 1h")
+                            // Signing in again makes Claude Code write a brand-new keychain
+                            // entry, so a 401 usually means our cached one is stale rather
+                            // than that the user is signed out. Drop it and search once more;
+                            // only park the profile if that search also fails.
+                            if !prof.isDefault, recordedKeychainService(dir) != nil {
+                                clearKeychainRecord(dir)
+                                self.discoveryAttempted.remove(dir)
+                                self.profileBlocked[dir] = Date().addingTimeInterval(30)
+                            } else {
+                                self.profileBlocked[dir] = Date().addingTimeInterval(kSignedOutBackoff)
+                                log("profile \(prof.name) signed out → not retrying for 1h")
+                            }
                         default: break
                         }
                         if isActive { self.set(.claude, result, generation: generation) }
@@ -285,7 +301,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func attemptDiscovery(_ prof: Profile) {
         let dir = prof.configDir
         guard !prof.isDefault, recordedKeychainService(dir) == nil,
-              let expected = profileAuth[dir]?.email, !discoveryAttempted.contains(dir) else { return }
+              !discoveryAttempted.contains(dir),
+              let expected = boundAccount(dir) ?? profileAuth[dir]?.email else { return }
         discoveryAttempted.insert(dir)
         DispatchQueue.global(qos: .utility).async {
             let found = discoverKeychainService(profileDir: dir, expectedEmail: expected) { creds, done in
@@ -569,6 +586,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             addSection(menu, for: p)
         }
 
+        if Provider.allCases.contains(where: { listProfiles($0).count > 1 }), !shellSnippetInstalled() {
+            menu.addItem(.separator())
+            disabled(menu, "⚠︎ Shell setup not installed", bold: true)
+            disabled(menu, "Switching won't affect `claude`, and signing in will overwrite", bold: false)
+            disabled(menu, "your default profile. Use Copy Shell Setup.", bold: false)
+        }
         menu.addItem(.separator())
         menu.addItem(item("Refresh Now", #selector(refreshClicked), "r"))
         for p in providers {
@@ -644,9 +667,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return profiles.map { prof in
             let usage = profileUsage[prof.configDir]
             let pct = usage?.metrics.first { $0.id == pinned }?.pct ?? usage?.metrics.first?.pct
-            let label = profileAuth[prof.configDir]?.email
+            let bound = prof.isDefault ? nil : boundAccount(prof.configDir)
+            let signedInAs = profileAuth[prof.configDir]?.email
+            var label = bound
+                ?? signedInAs
                 ?? usage?.email
                 ?? (prof.isDefault && provider == .claude ? (claudeEmail ?? prof.name) : prof.name)
+            if let bound = bound, let now = signedInAs,
+               bound.caseInsensitiveCompare(now) != .orderedSame {
+                label = "\(prof.name): signed in as \(now)"   // never silently relabel
+            }
             return InfoCardView.Account(dir: prof.configDir, label: label, pct: pct,
                                         active: prof.configDir == active)
         }
@@ -715,6 +745,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if listProfiles(provider).count > 1 && !shellSnippetInstalled() {
             disabled(sub, "⚠︎ Shell setup not installed — switching won't affect `claude`", bold: false)
         }
+        let signIn = item("Copy Sign-in Command…", #selector(copySignIn(_:)), "")
+        signIn.representedObject = [provider.rawValue, activeProfileDir(provider)]
+        sub.addItem(signIn)
         let add = item("Add Subscription…", #selector(addProfile(_:)), "")
         add.representedObject = provider.rawValue
         sub.addItem(add)
@@ -823,6 +856,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let pair = sender.representedObject as? [String], pair.count == 2,
               let provider = Provider(rawValue: pair[0]) else { return }
         switchProfile(provider, to: pair[1])
+    }
+
+    @objc func copySignIn(_ sender: NSMenuItem) {
+        guard let pair = sender.representedObject as? [String], pair.count == 2,
+              let provider = Provider(rawValue: pair[0]) else { return }
+        let dir = pair[1]
+        let cmd = signInCommand(provider, profileDir: dir)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(cmd, forType: .string)
+        let name = listProfiles(provider).first { $0.configDir == dir }?.name ?? "this profile"
+        let alert = NSAlert()
+        alert.messageText = "Sign-in command copied"
+        alert.informativeText = "Paste it in a terminal to sign \(name) in:\n\n\(cmd)\n\n"
+            + "It names the profile explicitly, so the login can't land on a different one. "
+            + "Plain `\(provider.cliName) \(provider == .claude ? "/login" : "login")` always "
+            + "writes to your default profile and would overwrite whatever account is there."
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
     }
 
     @objc func addProfile(_ sender: NSMenuItem) {
