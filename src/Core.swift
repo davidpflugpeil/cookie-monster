@@ -21,7 +21,7 @@ let kInactiveProfileInterval: TimeInterval = 900
 let kSignedOutBackoff: TimeInterval = 3600
 let kLogDir = (cmHome() as NSString).appendingPathComponent(".cookie-monster")
 let kLogFile = (kLogDir as NSString).appendingPathComponent("cookie-monster.log")
-let kVersion = "0.5.4"
+let kVersion = "0.6.0"
 
 // MARK: - Logging (no secrets ever pass through here)
 
@@ -347,7 +347,9 @@ func listProfiles(_ provider: Provider) -> [Profile] {
         let dir = (root as NSString).appendingPathComponent(name)
         var isDir: ObjCBool = false
         guard FileManager.default.fileExists(atPath: dir, isDirectory: &isDir), isDir.boolValue else { continue }
-        out.append(Profile(provider: provider, name: name, configDir: dir))
+        out.append(Profile(provider: provider,
+                           name: profileDisplayName(dir, fallback: name),
+                           configDir: dir))
     }
     return out
 }
@@ -679,6 +681,37 @@ private func serviceRecordPath(_ profileDir: String) -> String {
 
 private func accountRecordPath(_ profileDir: String) -> String {
     (profileDir as NSString).appendingPathComponent(".cookie-monster-account")
+}
+
+private func nameRecordPath(_ profileDir: String) -> String {
+    (profileDir as NSString).appendingPathComponent(".cookie-monster-name")
+}
+
+/// A profile's label. Stored as a file inside the profile rather than by renaming the
+/// directory: the active-profile file holds an absolute path, and a `claude` session may
+/// already be running against the old one, so moving directories would break both.
+func profileDisplayName(_ profileDir: String, fallback: String) -> String {
+    guard let s = try? String(contentsOfFile: nameRecordPath(profileDir), encoding: .utf8) else {
+        return fallback
+    }
+    let n = s.trimmingCharacters(in: .whitespacesAndNewlines)
+    return n.isEmpty ? fallback : n
+}
+
+func isValidDisplayName(_ raw: String) -> Bool {
+    let n = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    return !n.isEmpty && n.count <= 40 && !n.contains("\n")
+}
+
+@discardableResult
+func setProfileDisplayName(_ profileDir: String, _ raw: String) -> Bool {
+    let name = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard isValidDisplayName(name), assertInsideProfiles(profileDir) else { return false }
+    do {
+        try name.write(toFile: nameRecordPath(profileDir), atomically: true, encoding: .utf8)
+        log("profile renamed to \(name)")
+        return true
+    } catch { return false }
 }
 
 /// The account a profile is *meant* to be. Written once, when the profile is first seen

@@ -136,6 +136,20 @@ check("real codex auth.json untouched",
 check("shell setup covers both CLIs",
       "\(kShellSnippet.contains("CLAUDE_CONFIG_DIR") && kShellSnippet.contains("CODEX_HOME"))", "true")
 
+// Renaming changes the label only — never the directory, the account or the credentials.
+let dirBefore = p.configDir
+check("default label is the folder name", listProfiles(.claude).first { $0.configDir == dirBefore }?.name ?? "?", "work")
+check("rename accepted", "\(setProfileDisplayName(dirBefore, "Personal Max"))", "true")
+check("label changed", listProfiles(.claude).first { $0.configDir == dirBefore }?.name ?? "?", "Personal Max")
+check("directory did NOT move", "\(fm.fileExists(atPath: dirBefore))", "true")
+check("bound account survives rename", boundAccount(dirBefore) ?? "nil", "nil")
+check("rejects empty", "\(setProfileDisplayName(dirBefore, "   "))", "false")
+check("rejects over-long", "\(setProfileDisplayName(dirBefore, String(repeating: "x", count: 41)))", "false")
+check("label still intact after rejected renames",
+      listProfiles(.claude).first { $0.configDir == dirBefore }?.name ?? "?", "Personal Max")
+check("rename cannot write outside the profiles dir",
+      "\(setProfileDisplayName(home + "/.claude", "hack"))", "false")
+
 // THE ONE THAT MATTERS: the user's own config, byte for byte.
 check("~/.claude.json unchanged", sha(homeCfg), beforeCfg)
 check("~/.claude/settings.json unchanged", sha(homeSettings), beforeSettings)

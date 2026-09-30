@@ -681,13 +681,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let pct = usage?.metrics.first { $0.id == pinned }?.pct ?? usage?.metrics.first?.pct
             let bound = prof.isDefault ? nil : boundAccount(prof.configDir)
             let signedInAs = profileAuth[prof.configDir]?.email
-            var label = bound
-                ?? signedInAs
-                ?? usage?.email
-                ?? (prof.isDefault && provider == .claude ? (claudeEmail ?? prof.name) : prof.name)
+            let account = bound ?? signedInAs ?? usage?.email
+                ?? (prof.isDefault && provider == .claude ? claudeEmail : nil)
+            // Lead with the label the user assigned; the account follows it.
+            var label = account.map { "\(prof.name) — \($0)" } ?? prof.name
             if let bound = bound, let now = signedInAs,
                bound.caseInsensitiveCompare(now) != .orderedSame {
-                label = "\(prof.name): signed in as \(now)"   // never silently relabel
+                label = "\(prof.name) — signed in as \(now)"   // never silently relabel
             }
             return InfoCardView.Account(dir: prof.configDir, label: label, pct: pct,
                                         active: prof.configDir == active)
@@ -780,6 +780,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         sub.addItem(.separator())
         if listProfiles(provider).count > 1 && !shellSnippetInstalled() {
             disabled(sub, "⚠︎ Shell setup not installed — switching won't affect `claude`", bold: false)
+        }
+        let activeProfile = listProfiles(provider).first { $0.configDir == active }
+        if let activeProfile = activeProfile, !activeProfile.isDefault {
+            let ren = item("Rename “\(activeProfile.name)”…", #selector(renameProfile(_:)), "")
+            ren.representedObject = [provider.rawValue, activeProfile.configDir]
+            sub.addItem(ren)
         }
         let signIn = item("Copy Sign-in Command…", #selector(copySignIn(_:)), "")
         signIn.representedObject = [provider.rawValue, activeProfileDir(provider)]
@@ -892,6 +898,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let pair = sender.representedObject as? [String], pair.count == 2,
               let provider = Provider(rawValue: pair[0]) else { return }
         switchProfile(provider, to: pair[1])
+    }
+
+    @objc func renameProfile(_ sender: NSMenuItem) {
+        guard let pair = sender.representedObject as? [String], pair.count == 2,
+              let provider = Provider(rawValue: pair[0]) else { return }
+        let dir = pair[1]
+        let current = listProfiles(provider).first { $0.configDir == dir }?.name ?? ""
+        let alert = NSAlert()
+        alert.messageText = "Rename subscription"
+        alert.informativeText = "Only the label changes. The account signed into this profile, "
+            + "its settings and its credentials all stay exactly where they are."
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
+        field.stringValue = current
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Rename")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        alert.window.initialFirstResponder = field
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        guard setProfileDisplayName(dir, field.stringValue) else {
+            let fail = NSAlert()
+            fail.messageText = "Couldn't rename"
+            fail.informativeText = "Use up to 40 characters on a single line."
+            fail.alertStyle = .warning
+            NSApp.activate(ignoringOtherApps: true)
+            fail.runModal()
+            return
+        }
+        render()
     }
 
     @objc func copySignIn(_ sender: NSMenuItem) {
@@ -1092,15 +1127,23 @@ final class InfoCardView: NSView {
                     let dot = NSRect(x: x, y: y + 4, width: 6, height: 6)
                     (a.active ? NSColor.controlAccentColor : NSColor.quaternaryLabelColor).setFill()
                     NSBezierPath(ovalIn: dot).fill()
-                    left(t(a.label, .systemFont(ofSize: 12, weight: a.active ? .semibold : .regular),
-                           a.active ? .labelColor : .secondaryLabelColor), x + 14, y)
-                    if let pct = a.pct {
-                        right(t(String(format: "%.0f%%", pct),
-                                .monospacedDigitSystemFont(ofSize: 12, weight: a.active ? .bold : .regular),
-                                a.active ? .labelColor : .secondaryLabelColor), w - x, y)
-                    } else {
-                        right(t("—", .systemFont(ofSize: 12, weight: .regular), .tertiaryLabelColor), w - x, y)
-                    }
+                    let value = a.pct.map { String(format: "%.0f%%", $0) } ?? "—"
+                    let valueText = t(value,
+                                      .monospacedDigitSystemFont(ofSize: 12, weight: a.active ? .bold : .regular),
+                                      a.pct == nil ? .tertiaryLabelColor
+                                                   : (a.active ? .labelColor : .secondaryLabelColor))
+                    right(valueText, w - x, y)
+                    // Clip the label to the space left over, so renaming to something long
+                    // can never overlap the number.
+                    let labelX = x + 14
+                    let avail = (w - x) - valueText.size().width - 10 - labelX
+                    let para = NSMutableParagraphStyle()
+                    para.lineBreakMode = .byTruncatingTail
+                    NSAttributedString(string: a.label, attributes: [
+                        .font: NSFont.systemFont(ofSize: 12, weight: a.active ? .semibold : .regular),
+                        .foregroundColor: a.active ? NSColor.labelColor : NSColor.secondaryLabelColor,
+                        .paragraphStyle: para,
+                    ]).draw(in: NSRect(x: labelX, y: y, width: max(40, avail), height: 16))
                 }
                 y += 24
             }
@@ -1148,8 +1191,10 @@ final class InfoCardView: NSView {
             y += resetH
             if i < rows.count - 1 { y += 16 }
         }
-        y += pad + 7
-        if paint { NSColor.quaternaryLabelColor.setFill(); NSRect(x: x, y: y, width: cw, height: 1).fill() }
+        if !rows.isEmpty {
+            y += pad + 7
+            if paint { NSColor.quaternaryLabelColor.setFill(); NSRect(x: x, y: y, width: cw, height: 1).fill() }
+        }
         y += 13
         if paint {
             if !rows.isEmpty {

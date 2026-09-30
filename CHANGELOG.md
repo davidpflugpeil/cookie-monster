@@ -4,6 +4,17 @@ All notable changes to Cookie Monster are documented here. The format is based o
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.6.0] — 2026-09-30
+
+### Added
+- **Rename a subscription.** Each provider's submenu gains **Rename “…”** for the
+  active profile. The label is stored inside the profile rather than by renaming
+  the directory — the active-profile file holds an absolute path and a `claude`
+  session may already be running against it, so moving directories would break
+  both. Only the label changes: the account, credentials and settings stay put.
+- Switcher rows now read **`Label — account`**, leading with the name you chose,
+  and the label is truncated so a long name can never overlap the percentage.
+
 ## [0.5.4] — 2026-09-30
 
 ### Fixed
