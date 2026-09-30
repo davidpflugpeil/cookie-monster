@@ -4,6 +4,19 @@ All notable changes to Cookie Monster are documented here. The format is based o
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.5.4] — 2026-09-30
+
+### Fixed
+- **Switching no longer flashes "usage unavailable for a switched profile".** Two
+  causes: the card showed a placeholder while the profile's credentials were being
+  located, and it dropped the account switcher entirely while doing so — stranding
+  you on a profile with no way back except the submenu.
+  - The switcher now survives every state, including "not signed in" and errors.
+  - A switch reuses the reading already taken for the switcher, so the numbers are
+    there immediately.
+  - The transient wording reads as progress ("reading this profile's usage…"),
+    because it is — not as a permanent failure.
+
 ## [0.5.3] — 2026-09-30
 
 ### Added

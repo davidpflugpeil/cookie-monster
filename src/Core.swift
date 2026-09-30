@@ -21,7 +21,7 @@ let kInactiveProfileInterval: TimeInterval = 900
 let kSignedOutBackoff: TimeInterval = 3600
 let kLogDir = (cmHome() as NSString).appendingPathComponent(".cookie-monster")
 let kLogFile = (kLogDir as NSString).appendingPathComponent("cookie-monster.log")
-let kVersion = "0.5.3"
+let kVersion = "0.5.4"
 
 // MARK: - Logging (no secrets ever pass through here)
 

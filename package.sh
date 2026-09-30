@@ -4,7 +4,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-VERSION="0.5.3"
+VERSION="0.5.4"
 APP="Cookie Monster.app"
 DMG="dist/Cookie-Monster-${VERSION}.dmg"
 ZIP="dist/Cookie-Monster-${VERSION}.zip"

@@ -230,6 +230,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             set(.claude, .notConfigured); return
         }
         if states[.claude] == nil { states[.claude] = .loading }
+        // The switcher already polls every profile, so a switch usually has a recent reading
+        // in hand. Show it at once rather than a placeholder while the fetch completes.
+        if let cached = profileUsage[active.dir] {
+            set(.claude, .ok(cached), generation: generation)
+        }
         // Every profile, not just the active one — the switcher shows each subscription's
         // pinned metric, so each needs its own reading.
         for prof in listProfiles(.claude) {
@@ -363,6 +368,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             set(.codex, .error("profile folder missing — pick another subscription"))
             return
         }
+        if let cached = profileUsage[active.dir] { set(.codex, .ok(cached)) }
         for prof in listProfiles(.codex) {
             let isActive = prof.configDir == active.dir
             if let until = profileBlocked[prof.configDir], Date() < until { continue }
@@ -632,6 +638,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 disabled(menu, "\(p.label) — rate limited", bold: true)
                 disabled(menu, "retrying in \(countdown(to: until))", bold: false)
             }
+        case .otherProfile where listProfiles(p).count > 1:
+            addSwitcherCard(menu, p, note: otherProfileNote(p))
         case .otherProfile:
             // Looked up here, not captured in the state: the probe answers asynchronously.
             let dir = activeProfileDir(p)
@@ -646,6 +654,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 detail = "couldn't identify this profile (is `claude` on your PATH?)"
             }
             disabled(menu, detail, bold: false)
+        case .needsAuth where listProfiles(p).count > 1:
+            addSwitcherCard(menu, p, note: "not signed in — use Copy Sign-in Command")
+        case .error(let msg) where listProfiles(p).count > 1 && lastGood[p] == nil:
+            addSwitcherCard(menu, p, note: msg)
         case .error(let msg):
             if let u = lastGood[p] {
                 addCard(menu, p, u) { "couldn't refresh" }
@@ -680,6 +692,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return InfoCardView.Account(dir: prof.configDir, label: label, pct: pct,
                                         active: prof.configDir == active)
         }
+    }
+
+    /// A card with the switcher but no usage rows, so a profile that can't be read yet still
+    /// lets you pick a different one without hunting through the submenu.
+    private func addSwitcherCard(_ menu: NSMenu, _ p: Provider, note: String) {
+        let card = InfoCardView(title: p.label, email: nil, rows: [], fetchedAt: Date(),
+                                note: { note },
+                                accounts: switcherAccounts(p),
+                                onSwitch: { [weak self] dir in self?.switchProfile(p, to: dir) },
+                                pinnedID: nil, onPick: { _ in })
+        let entry = NSMenuItem()
+        entry.isEnabled = true
+        entry.view = card
+        liveRefreshers.append { [weak card] in card?.refresh() }
+        menu.addItem(entry)
+    }
+
+    /// Reads as progress, not failure: locating a switched profile's credentials takes a
+    /// couple of seconds, and "usage unavailable" looked like a permanent error.
+    private func otherProfileNote(_ p: Provider) -> String {
+        let dir = activeProfileDir(p)
+        guard let auth = profileAuth[dir] else { return "identifying this profile…" }
+        return auth.loggedIn ? "reading this profile's usage…"
+                             : "not signed in — use Copy Sign-in Command"
     }
 
     private func addCard(_ menu: NSMenu, _ p: Provider, _ u: ProviderUsage,
@@ -1116,9 +1152,13 @@ final class InfoCardView: NSView {
         if paint { NSColor.quaternaryLabelColor.setFill(); NSRect(x: x, y: y, width: cw, height: 1).fill() }
         y += 13
         if paint {
-            left(t("Updated \(ago(fetchedAt))", .systemFont(ofSize: 12, weight: .regular), .secondaryLabelColor), x, y)
+            if !rows.isEmpty {
+                left(t("Updated \(ago(fetchedAt))", .systemFont(ofSize: 12, weight: .regular), .secondaryLabelColor), x, y)
+            }
             if let note = note() {
-                right(t(note, .systemFont(ofSize: 12, weight: .medium), .systemOrange), w - x, y)
+                let style = t(note, .systemFont(ofSize: 12, weight: .medium),
+                              rows.isEmpty ? .secondaryLabelColor : .systemOrange)
+                if rows.isEmpty { left(style, x, y) } else { right(style, w - x, y) }
             }
         }
         y += 16 + 13
