@@ -4,6 +4,13 @@ All notable changes to Cookie Monster are documented here. The format is based o
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.6.1] — 2026-09-30
+
+### Added
+- **The default subscription can be renamed too.** Its config directory is your own
+  `~/.claude` / `~/.codex`, which this app never writes to, so its label is stored
+  in `~/.cookie-monster/` instead. Renaming still touches nothing of yours.
+
 ## [0.6.0] — 2026-09-30
 
 ### Added

@@ -21,7 +21,7 @@ let kInactiveProfileInterval: TimeInterval = 900
 let kSignedOutBackoff: TimeInterval = 3600
 let kLogDir = (cmHome() as NSString).appendingPathComponent(".cookie-monster")
 let kLogFile = (kLogDir as NSString).appendingPathComponent("cookie-monster.log")
-let kVersion = "0.6.0"
+let kVersion = "0.6.1"
 
 // MARK: - Logging (no secrets ever pass through here)
 
@@ -340,7 +340,9 @@ private func stripSymlinks(under dir: String) {
 }
 
 func listProfiles(_ provider: Provider) -> [Profile] {
-    var out = [Profile(provider: provider, name: "Default", configDir: provider.defaultConfigDir)]
+    var out = [Profile(provider: provider,
+                       name: profileDisplayName(provider.defaultConfigDir, fallback: "Default"),
+                       configDir: provider.defaultConfigDir)]
     let root = provider.profilesDir
     for name in ((try? FileManager.default.contentsOfDirectory(atPath: root)) ?? []).sorted()
     where !name.hasPrefix(".") {
@@ -683,17 +685,23 @@ private func accountRecordPath(_ profileDir: String) -> String {
     (profileDir as NSString).appendingPathComponent(".cookie-monster-account")
 }
 
-private func nameRecordPath(_ profileDir: String) -> String {
-    (profileDir as NSString).appendingPathComponent(".cookie-monster-name")
+/// Where a profile's label lives. The default profile's config dir is the user's own
+/// ~/.claude or ~/.codex, which this app never writes to — so its label is kept in our own
+/// directory instead. Returns nil for anything we have no business writing to.
+private func nameRecordPath(_ profileDir: String) -> String? {
+    if let provider = Provider.allCases.first(where: { $0.defaultConfigDir == profileDir }) {
+        return (kLogDir as NSString).appendingPathComponent("display-name-\(provider.rawValue)")
+    }
+    guard assertInsideProfiles(profileDir) else { return nil }
+    return (profileDir as NSString).appendingPathComponent(".cookie-monster-name")
 }
 
 /// A profile's label. Stored as a file inside the profile rather than by renaming the
 /// directory: the active-profile file holds an absolute path, and a `claude` session may
 /// already be running against the old one, so moving directories would break both.
 func profileDisplayName(_ profileDir: String, fallback: String) -> String {
-    guard let s = try? String(contentsOfFile: nameRecordPath(profileDir), encoding: .utf8) else {
-        return fallback
-    }
+    guard let path = nameRecordPath(profileDir),
+          let s = try? String(contentsOfFile: path, encoding: .utf8) else { return fallback }
     let n = s.trimmingCharacters(in: .whitespacesAndNewlines)
     return n.isEmpty ? fallback : n
 }
@@ -706,9 +714,10 @@ func isValidDisplayName(_ raw: String) -> Bool {
 @discardableResult
 func setProfileDisplayName(_ profileDir: String, _ raw: String) -> Bool {
     let name = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard isValidDisplayName(name), assertInsideProfiles(profileDir) else { return false }
+    guard isValidDisplayName(name), let path = nameRecordPath(profileDir) else { return false }
+    try? FileManager.default.createDirectory(atPath: kLogDir, withIntermediateDirectories: true)
     do {
-        try name.write(toFile: nameRecordPath(profileDir), atomically: true, encoding: .utf8)
+        try name.write(toFile: path, atomically: true, encoding: .utf8)
         log("profile renamed to \(name)")
         return true
     } catch { return false }

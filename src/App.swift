@@ -781,8 +781,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if listProfiles(provider).count > 1 && !shellSnippetInstalled() {
             disabled(sub, "⚠︎ Shell setup not installed — switching won't affect `claude`", bold: false)
         }
-        let activeProfile = listProfiles(provider).first { $0.configDir == active }
-        if let activeProfile = activeProfile, !activeProfile.isDefault {
+        if let activeProfile = listProfiles(provider).first(where: { $0.configDir == active }) {
             let ren = item("Rename “\(activeProfile.name)”…", #selector(renameProfile(_:)), "")
             ren.representedObject = [provider.rawValue, activeProfile.configDir]
             sub.addItem(ren)

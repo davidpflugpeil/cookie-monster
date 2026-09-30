@@ -147,8 +147,19 @@ check("rejects empty", "\(setProfileDisplayName(dirBefore, "   "))", "false")
 check("rejects over-long", "\(setProfileDisplayName(dirBefore, String(repeating: "x", count: 41)))", "false")
 check("label still intact after rejected renames",
       listProfiles(.claude).first { $0.configDir == dirBefore }?.name ?? "?", "Personal Max")
-check("rename cannot write outside the profiles dir",
-      "\(setProfileDisplayName(home + "/.claude", "hack"))", "false")
+// The default profile is renameable, but its label is stored in our own directory —
+// ~/.claude must never be written to.
+check("default profile can be renamed",
+      "\(setProfileDisplayName(Provider.claude.defaultConfigDir, "Personal"))", "true")
+check("default label applied",
+      listProfiles(.claude).first { $0.isDefault }?.name ?? "?", "Personal")
+let strayName = (Provider.claude.defaultConfigDir as NSString)
+    .appendingPathComponent(".cookie-monster-name")
+check("nothing written into ~/.claude", "\(fm.fileExists(atPath: strayName))", "false")
+let ourName = (kLogDir as NSString).appendingPathComponent("display-name-claude")
+check("label stored in our own dir", "\(fm.fileExists(atPath: ourName))", "true")
+check("rename still cannot write to an arbitrary path",
+      "\(setProfileDisplayName(home + "/somewhere-else", "hack"))", "false")
 
 // THE ONE THAT MATTERS: the user's own config, byte for byte.
 check("~/.claude.json unchanged", sha(homeCfg), beforeCfg)
