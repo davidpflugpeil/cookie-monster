@@ -17,11 +17,13 @@ let kLoginPlistLabel = "com.pflugpeil.cookiemonster"
 let kPollInterval: TimeInterval = 300
 /// Inactive profiles only feed the switcher; they don't need the active one's freshness.
 let kInactiveProfileInterval: TimeInterval = 900
+/// How often to re-search for a profile's keychain entry after a failed attempt.
+let kDiscoveryRetryInterval: TimeInterval = 600
 /// A 401 can only be fixed by a human signing in, so stop asking for a while.
 let kSignedOutBackoff: TimeInterval = 3600
 let kLogDir = (cmHome() as NSString).appendingPathComponent(".cookie-monster")
 let kLogFile = (kLogDir as NSString).appendingPathComponent("cookie-monster.log")
-let kVersion = "0.6.1"
+let kVersion = "0.6.2"
 
 // MARK: - Logging (no secrets ever pass through here)
 
@@ -109,6 +111,7 @@ enum FetchState {
     case loading
     case ok(ProviderUsage)
     case needsAuth          // installed but no token, or 401/403
+    case tokenExpired       // stored token is past expiry; running the CLI once refreshes it
     case rateLimited(Date)  // 429 — do not call again before this date
     case otherProfile      // a non-default profile is active; its token isn't readable
     case error(String)
@@ -756,31 +759,70 @@ func clearKeychainRecord(_ profileDir: String) {
     log("profile \((profileDir as NSString).lastPathComponent): cached keychain entry cleared")
 }
 
+/// Entries already claimed by another profile (or by the default login). Without this, two
+/// profiles whose `auth status` reports the same address could both bind to one entry.
+func claimedKeychainServices(excluding profileDir: String) -> Set<String> {
+    var claimed: Set<String> = [kKeychainService]
+    for prof in listProfiles(.claude) where prof.configDir != profileDir && !prof.isDefault {
+        if let s = recordedKeychainService(prof.configDir) { claimed.insert(s) }
+    }
+    return claimed
+}
+
 /// Finds and verifies the keychain entry for a profile. Verification is the whole point:
 /// the entry must belong to the account this profile is bound to, or the app would show one
 /// subscription's usage under another's label — and signing in again creates a new entry, so
 /// this has to be re-runnable rather than pinned once.
 func discoverKeychainService(profileDir: String, expectedEmail: String?,
                              verify: (Credentials, @escaping (String?) -> Void) -> Void) -> String? {
-    guard let expected = expectedEmail else { return nil }
+    let claimed = claimedKeychainServices(excluding: profileDir)
+    let candidates = claudeCredentialServices().filter { !claimed.contains($0.service) }
+
+    // Correlation fallback, computed first because it costs nothing: Claude Code writes the
+    // keychain entry and the profile's own config in the same moment, so the entry whose
+    // modification time matches the profile's last sign-in is almost certainly the one. This
+    // matters because an EXPIRED token cannot be verified against the API at all — and a
+    // profile left unused for days always has one.
+    let profileStamp = [".claude.json", "settings.json"].compactMap { name -> Date? in
+        let f = (profileDir as NSString).appendingPathComponent(name)
+        return (try? FileManager.default.attributesOfItem(atPath: f))?[.modificationDate] as? Date
+    }.min()
+    let correlated = profileStamp.flatMap { stamp in
+        candidates.first { abs($0.created.timeIntervalSince(stamp)) < 300 }
+    }
     // Newest first: the right entry is the one written when the profile was last signed in.
-    // Not filtered by the profile's creation date any more — a re-login can happen at any
-    // time, and the old filter is why a stale entry stayed pinned.
-    for candidate in claudeCredentialServices().prefix(6) {
+    for candidate in candidates.prefix(8) {
         guard let creds = readCredentials(service: candidate.service) else { continue }
         let sem = DispatchSemaphore(value: 0)
         var found: String?
         verify(creds) { found = $0; sem.signal() }
         _ = sem.wait(timeout: .now() + 20)
-        guard let email = found else { continue }
-        guard email.caseInsensitiveCompare(expected) == .orderedSame else { continue }
+        guard let email = found else { continue }   // dead token; try the next one
+
+        if let expected = expectedEmail {
+            guard email.caseInsensitiveCompare(expected) == .orderedSame else { continue }
+        } else {
+            // First sighting: bind to the account the TOKEN resolves to. `claude auth status`
+            // mirrors ~/.claude.json and has been observed naming the wrong address, so it
+            // must not be what a label is pinned to.
+            bindAccount(profileDir, email: email)
+        }
         guard assertInsideProfiles(profileDir) else { return nil }
         try? candidate.service.write(toFile: serviceRecordPath(profileDir),
                                      atomically: true, encoding: .utf8)
-        log("profile \((profileDir as NSString).lastPathComponent): keychain entry for \(email) found")
+        log("profile \((profileDir as NSString).lastPathComponent): entry for \(email) found")
         return candidate.service
     }
-    log("profile \((profileDir as NSString).lastPathComponent): no keychain entry matches \(expected)")
+    // Nothing verified — every candidate's token is expired or belongs elsewhere. Fall back
+    // to the time correlation; a wrong guess is corrected the moment a live fetch disagrees.
+    if let correlated = correlated, assertInsideProfiles(profileDir) {
+        try? correlated.service.write(toFile: serviceRecordPath(profileDir),
+                                      atomically: true, encoding: .utf8)
+        log("profile \((profileDir as NSString).lastPathComponent): matched entry by sign-in time")
+        return correlated.service
+    }
+    log("profile \((profileDir as NSString).lastPathComponent): no unclaimed entry matches"
+        + (expectedEmail.map { " \($0)" } ?? ""))
     return nil
 }
 
@@ -878,6 +920,13 @@ func rateLimitedState(_ http: HTTPURLResponse, _ data: Data?, _ who: String) -> 
 // MARK: - Claude fetch
 
 func fetchClaudeUsage(creds: Credentials, email: String?, completion: @escaping (FetchState) -> Void) {
+    // Claude Code refreshes its access token lazily — only when you actually run it. Leave
+    // the CLI unused for a few days and the stored token sits expired, so sending it just
+    // collects 401s and spends an hourly quota shared with your own sessions. The expiry is
+    // right there in the keychain blob, so check it locally and don't make the call at all.
+    if let expiry = creds.expiresAt, expiry <= Date() {
+        completion(.tokenExpired); return
+    }
     var req = URLRequest(url: kUsageURL)
     req.httpMethod = "GET"
     req.setValue("Bearer \(creds.accessToken)", forHTTPHeaderField: "Authorization")
@@ -928,6 +977,7 @@ func fetchClaudeUsage(creds: Credentials, email: String?, completion: @escaping 
 
 /// Fetches the signed-in Claude account's email.
 func fetchAccountEmail(creds: Credentials, completion: @escaping (String?) -> Void) {
+    if let expiry = creds.expiresAt, expiry <= Date() { completion(nil); return }
     var req = URLRequest(url: kAccountURL)
     req.setValue("Bearer \(creds.accessToken)", forHTTPHeaderField: "Authorization")
     req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")

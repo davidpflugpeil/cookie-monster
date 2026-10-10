@@ -4,6 +4,32 @@ All notable changes to Cookie Monster are documented here. The format is based o
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.6.2] — 2026-10-10
+
+### Fixed
+- **The real cause of the rate limiting.** Claude Code refreshes its access token
+  *lazily* — only when you actually run it. Leave the CLI unused for a few days
+  and the token in the keychain sits expired, and Cookie Monster kept sending it:
+  a `401` every poll, against an hourly quota shared with your own Claude Code
+  sessions. The expiry is in the keychain blob all along, so it is now checked
+  locally and **no request is made at all** when the token is stale. The card says
+  `token expired — run \`claude\` once to refresh it`, which is exactly what fixes
+  it. Costs nothing, so it recovers on the very next poll.
+- **A profile no longer gets stranded.** The keychain search ran once per launch;
+  one failure left that subscription dark until the app was restarted. It now
+  retries every 10 minutes.
+- **A cached reading is never replaced by a placeholder.** The card could sit on
+  "reading this profile's usage…" while the switcher directly above it showed that
+  same profile's percentage.
+- **Profiles are bound from the token, not `claude auth status`.** That field
+  mirrors `~/.claude.json` and was observed naming the wrong account — it had two
+  different subscriptions reporting the same address. Binding now comes from the
+  account a verified token resolves to, and two profiles can never claim the same
+  keychain entry.
+- **An expired token can still be matched to its profile.** It can't be verified
+  against the API, so the search falls back to correlating the entry's write time
+  with the profile's last sign-in — they are written in the same moment.
+
 ## [0.6.1] — 2026-09-30
 
 ### Added

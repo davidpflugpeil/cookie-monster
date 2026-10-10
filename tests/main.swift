@@ -161,6 +161,26 @@ check("label stored in our own dir", "\(fm.fileExists(atPath: ourName))", "true"
 check("rename still cannot write to an arbitrary path",
       "\(setProfileDisplayName(home + "/somewhere-else", "hack"))", "false")
 
+// An expired token must never reach the network: Claude Code refreshes lazily, so a CLI
+// left unused for days leaves one behind, and sending it just collects 401s against a
+// quota shared with the user's own sessions.
+let expired = Credentials(accessToken: "x", plan: "max", expiresAt: Date(timeIntervalSinceNow: -3600))
+var expiredState = "none"
+let t0 = Date()
+let sem = DispatchSemaphore(value: 0)
+fetchClaudeUsage(creds: expired, email: nil) { r in
+    if case .tokenExpired = r { expiredState = "tokenExpired" } else { expiredState = "\(r)" }
+    sem.signal()
+}
+_ = sem.wait(timeout: .now() + 5)
+check("expired token short-circuits", expiredState, "tokenExpired")
+check("…without a network round trip", "\(Date().timeIntervalSince(t0) < 0.5)", "true")
+var emailResult = "unset"
+let sem2 = DispatchSemaphore(value: 0)
+fetchAccountEmail(creds: expired) { e in emailResult = e ?? "nil"; sem2.signal() }
+_ = sem2.wait(timeout: .now() + 5)
+check("account lookup skipped too", emailResult, "nil")
+
 // THE ONE THAT MATTERS: the user's own config, byte for byte.
 check("~/.claude.json unchanged", sha(homeCfg), beforeCfg)
 check("~/.claude/settings.json unchanged", sha(homeSettings), beforeSettings)

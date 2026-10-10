@@ -105,7 +105,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var profileAuth: [String: AuthStatus] = [:]     // keyed by config dir
     var lastActiveProfile: [Provider: String] = [:]
     var claudeGeneration = 0                 // discards fetches issued for a previous profile
-    var discoveryAttempted: Set<String> = [] // one keychain search per profile per launch
+    var discoveryAttemptedAt: [String: Date] = [:]  // throttles the keychain search
     var profileUsage: [String: ProviderUsage] = [:]   // usage per profile, for the switcher
     var profileBlocked: [String: Date] = [:]          // per-profile 429 backoff
     var profileFetchedAt: [String: Date] = [:]        // throttles inactive profiles
@@ -190,13 +190,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             for p in profiles {
                 if let a = claudeAuthStatus(configDir: p.envConfigDir) { found[p.configDir] = a }
             }
-            for (dir, auth) in found {
-                // The label the user assigned must keep meaning the same subscription, so
-                // bind once and never rewrite. A later mismatch is surfaced, not absorbed.
-                if let email = auth.email, auth.loggedIn, dir != Provider.claude.defaultConfigDir {
-                    bindAccount(dir, email: email)
-                }
-            }
             DispatchQueue.main.async { self.profileAuth = found; self.render() }
         }
     }
@@ -258,7 +251,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let service = prof.isDefault ? kKeychainService : recordedKeychainService(dir)
             guard let service = service, let creds = readCredentials(service: service) else {
                 DispatchQueue.main.async {
-                    if isActive { self.set(.claude, .otherProfile, generation: generation) }
+                    // Only fall back to the placeholder when there is genuinely nothing to
+                    // show. Overwriting a cached reading left the card blank while the
+                    // switcher right above it displayed that same profile's percentage.
+                    if isActive, self.profileUsage[dir] == nil {
+                        self.set(.claude, .otherProfile, generation: generation)
+                    }
                     self.attemptDiscovery(prof)
                 }
                 return
@@ -279,6 +277,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                             self.profileUsage[dir] = u
                         case .rateLimited(let until):
                             self.profileBlocked[dir] = until
+                        case .tokenExpired:
+                            break   // free to re-check; no request was made
                         case .needsAuth:
                             // Signing in again makes Claude Code write a brand-new keychain
                             // entry, so a 401 usually means our cached one is stale rather
@@ -286,7 +286,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                             // only park the profile if that search also fails.
                             if !prof.isDefault, recordedKeychainService(dir) != nil {
                                 clearKeychainRecord(dir)
-                                self.discoveryAttempted.remove(dir)
+                                self.discoveryAttemptedAt[dir] = nil
                                 self.profileBlocked[dir] = Date().addingTimeInterval(30)
                             } else {
                                 self.profileBlocked[dir] = Date().addingTimeInterval(kSignedOutBackoff)
@@ -305,10 +305,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// One silent keychain search per profile per launch; see discoverKeychainService.
     private func attemptDiscovery(_ prof: Profile) {
         let dir = prof.configDir
-        guard !prof.isDefault, recordedKeychainService(dir) == nil,
-              !discoveryAttempted.contains(dir),
-              let expected = boundAccount(dir) ?? profileAuth[dir]?.email else { return }
-        discoveryAttempted.insert(dir)
+        guard !prof.isDefault, recordedKeychainService(dir) == nil else { return }
+        // Retry on an interval rather than once per launch: a single failed search used to
+        // leave the profile dark until the app was restarted.
+        if let last = discoveryAttemptedAt[dir], Date().timeIntervalSince(last) < kDiscoveryRetryInterval {
+            return
+        }
+        discoveryAttemptedAt[dir] = Date()
+        // No bound account yet means this is the first sighting; discovery binds to whatever
+        // the token resolves to.
+        let expected = boundAccount(dir)
         DispatchQueue.global(qos: .utility).async {
             let found = discoverKeychainService(profileDir: dir, expectedEmail: expected) { creds, done in
                 fetchAccountEmail(creds: creds, completion: done)
@@ -431,7 +437,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 let wait = min(1800 * pow(2, Double(min(n - 1, 3))), 14400)   // 30m → 4h
                 self.nextAllowed[p] = Date().addingTimeInterval(wait)
                 log("\(p.rawValue) needs sign-in → not retrying for \(Int(wait / 60))m")
-            case .notConfigured, .loading, .otherProfile:
+            case .tokenExpired, .notConfigured, .loading, .otherProfile:
                 self.nextAllowed[p] = nil
             }
             self.states[p] = s
@@ -520,6 +526,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let all = states.values
         if all.contains(where: { if case .loading = $0 { return true }; return false }) || all.isEmpty {
             applyButton(text: "…", color: nil, percent: nil)
+        } else if all.contains(where: { if case .tokenExpired = $0 { return true }; return false }) {
+            applyButton(text: "↻", color: .systemOrange, percent: nil)
         } else if all.contains(where: { if case .needsAuth = $0 { return true }; return false }) {
             applyButton(text: "⚠", color: .systemRed, percent: nil)
         } else if all.contains(where: { if case .error = $0 { return true }; return false }) {
@@ -654,6 +662,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 detail = "couldn't identify this profile (is `claude` on your PATH?)"
             }
             disabled(menu, detail, bold: false)
+        case .tokenExpired where listProfiles(p).count > 1:
+            addSwitcherCard(menu, p, note: "token expired — run `\(p.cliName)` once to refresh it")
+        case .tokenExpired:
+            disabled(menu, "\(p.label) — token expired", bold: true)
+            disabled(menu, "Run `\(p.cliName)` once; it refreshes the token automatically.", bold: false)
         case .needsAuth where listProfiles(p).count > 1:
             addSwitcherCard(menu, p, note: "not signed in — use Copy Sign-in Command")
         case .error(let msg) where listProfiles(p).count > 1 && lastGood[p] == nil:
