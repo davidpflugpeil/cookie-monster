@@ -26,7 +26,7 @@ let kRefreshLeadTime: TimeInterval = 1800
 let kSignedOutBackoff: TimeInterval = 3600
 let kLogDir = (cmHome() as NSString).appendingPathComponent(".cookie-monster")
 let kLogFile = (kLogDir as NSString).appendingPathComponent("cookie-monster.log")
-let kVersion = "0.7.0"
+let kVersion = "0.7.1"
 
 // MARK: - Logging (no secrets ever pass through here)
 
@@ -794,7 +794,10 @@ func usableCredentials(service: String) -> Credentials? {
     guard let expiry = creds.expiresAt else { return creds }   // no expiry recorded; use as-is
     if expiry.timeIntervalSinceNow > kRefreshLeadTime { return creds }
     if let refreshed = refreshAccessToken(service: service) { return refreshed }
-    return expiry > Date() ? creds : nil     // refresh failed; use it only if still valid
+    // Refresh failed (rate limited, offline, revoked). Hand back the stale credentials
+    // anyway: fetchClaudeUsage short-circuits on expiry without making a request, so the
+    // card can say "token expired" instead of the profile silently vanishing.
+    return creds
 }
 
 // MARK: - Finding a profile's keychain entry

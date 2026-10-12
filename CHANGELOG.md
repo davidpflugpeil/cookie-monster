@@ -4,6 +4,16 @@ All notable changes to Cookie Monster are documented here. The format is based o
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.7.1] — 2026-10-12
+
+### Fixed
+- **A failed refresh no longer makes the subscription disappear.** When the refresh
+  couldn't run (rate limited, offline, token revoked) the credentials were treated
+  as absent, so the card fell back to "couldn't identify this profile" and stopped
+  reporting entirely. The stale credentials are handed back instead — the usage
+  call still short-circuits locally on expiry, so no request is made, and the card
+  says `token expired` as it did in 0.6.2.
+
 ## [0.7.0] — 2026-10-12
 
 ### Added
