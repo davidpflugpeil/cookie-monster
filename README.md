@@ -96,9 +96,13 @@ display.
 Both are polled every 60 seconds (configurable). The pinned window's percentage
 goes in the bar, color-coded green < 50%, orange < 80%, red ≥ 80%.
 
-It is **read-only on your credentials**: it never writes to the keychain or to
-`~/.codex/auth.json`, never refreshes or modifies your tokens, and never logs a
-token or a raw API response. A small diagnostic log (status codes + percentages
+**Credentials:** the app reads your existing tokens and, since 0.7.0, refreshes an
+expired Claude access token using the standard OAuth refresh grant — writing the
+result back to the same keychain entry so Claude Code sees it too. That write is
+the only one it makes: it happens only on a successful refresh, the previous blob
+is backed up to `~/.cookie-monster/keychain-backups/` first, and it goes through
+`SecItemUpdate` so no secret reaches a command line. `~/.codex/auth.json` is still
+never written. A token or raw API response is never logged. A small diagnostic log (status codes + percentages
 only) is kept at `~/.cookie-monster/cookie-monster.log`.
 
 ## Settings

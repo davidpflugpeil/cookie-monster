@@ -249,7 +249,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         profileFetchedAt[dir] = Date()
         DispatchQueue.global(qos: .utility).async {
             let service = prof.isDefault ? kKeychainService : recordedKeychainService(dir)
-            guard let service = service, let creds = readCredentials(service: service) else {
+            guard let service = service, let creds = usableCredentials(service: service) else {
                 DispatchQueue.main.async {
                     // Only fall back to the placeholder when there is genuinely nothing to
                     // show. Overwriting a cached reading left the card blank while the

@@ -19,11 +19,14 @@ let kPollInterval: TimeInterval = 300
 let kInactiveProfileInterval: TimeInterval = 900
 /// How often to re-search for a profile's keychain entry after a failed attempt.
 let kDiscoveryRetryInterval: TimeInterval = 600
+/// Refresh this long before the access token actually expires, so a poll never lands on a
+/// dead token. Claude Code issues ~8h tokens.
+let kRefreshLeadTime: TimeInterval = 1800
 /// A 401 can only be fixed by a human signing in, so stop asking for a while.
 let kSignedOutBackoff: TimeInterval = 3600
 let kLogDir = (cmHome() as NSString).appendingPathComponent(".cookie-monster")
 let kLogFile = (kLogDir as NSString).appendingPathComponent("cookie-monster.log")
-let kVersion = "0.6.2"
+let kVersion = "0.7.0"
 
 // MARK: - Logging (no secrets ever pass through here)
 
@@ -656,6 +659,142 @@ func shellSnippetInstalled() -> Bool {
            text.contains("cookie-monster/active-profile-") { return true }
     }
     return false
+}
+
+// MARK: - Refreshing an expired access token
+
+let kOAuthTokenURL = URL(string: "https://platform.claude.com/v1/oauth/token")!
+/// Claude Code's own OAuth client id, read out of the installed binary rather than guessed.
+let kOAuthClientID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+let kKeychainBackupDir = (kLogDir as NSString).appendingPathComponent("keychain-backups")
+
+/// Keeps a copy of a credential blob before we overwrite it. OAuth servers commonly rotate
+/// refresh tokens, so a failed or raced write-back can cost the user their sign-in; this is
+/// the difference between "restore the backup" and "log in again".
+private func backupCredentialBlob(service: String, blob: String) {
+    try? FileManager.default.createDirectory(atPath: kKeychainBackupDir, withIntermediateDirectories: true)
+    let safe = slug(service)
+    let path = (kKeychainBackupDir as NSString).appendingPathComponent("\(safe).json")
+    try? blob.write(toFile: path, atomically: true, encoding: .utf8)
+    try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path)
+}
+
+/// Writes a credential blob back to its keychain item. Uses SecItemUpdate rather than the
+/// `security` CLI so the secret never appears in a process argument list.
+private func writeCredentialBlob(service: String, blob: String) -> Bool {
+    guard let data = blob.data(using: .utf8) else { return false }
+    let query: [String: Any] = [
+        kSecClass as String: kSecClassGenericPassword,
+        kSecAttrService as String: service,
+    ]
+    let status = SecItemUpdate(query as CFDictionary,
+                               [kSecValueData as String: data] as CFDictionary)
+    if status != errSecSuccess { log("keychain write failed for \(service): \(status)") }
+    return status == errSecSuccess
+}
+
+/// Exchanges the refresh token for a fresh access token, the same grant Claude Code uses.
+/// Returns the updated credentials, having persisted them so the CLI sees them too — the
+/// server may rotate the refresh token, and dropping the new one would sign the user out.
+private let refreshLock = NSLock()
+private var refreshBlockedUntil: [String: Date] = [:]
+
+func refreshAccessToken(service: String, timeout: TimeInterval = 20) -> Credentials? {
+    // The token endpoint rate-limits like everything else here. One attempt per service per
+    // five minutes, and a 429 parks it for an hour — a refresh storm is how this app has
+    // burned the user's quota before.
+    refreshLock.lock()
+    if let until = refreshBlockedUntil[service], Date() < until { refreshLock.unlock(); return nil }
+    refreshBlockedUntil[service] = Date().addingTimeInterval(300)
+    refreshLock.unlock()
+
+    guard let blob = keychainBlob(service: service), let data = blob.data(using: .utf8),
+          var root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+    let key = root["claudeAiOauth"] != nil ? "claudeAiOauth" : ""
+    var oauth = (root["claudeAiOauth"] as? [String: Any]) ?? root
+    guard let refresh = oauth["refreshToken"] as? String, !refresh.isEmpty else { return nil }
+    if let ms = (oauth["refreshTokenExpiresAt"] as? NSNumber)?.doubleValue,
+       Date(timeIntervalSince1970: ms / 1000) <= Date() {
+        log("refresh token itself has expired for \(service)")
+        return nil
+    }
+
+    let fields = ["grant_type": "refresh_token", "refresh_token": refresh,
+                  "client_id": kOAuthClientID]
+    func post(form: Bool) -> (Int, [String: Any]?) {
+        var req = URLRequest(url: kOAuthTokenURL)
+        req.httpMethod = "POST"
+        req.setValue("claude-code/\(claudeCodeVersion())", forHTTPHeaderField: "User-Agent")
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        if form {
+            req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+            var cs = CharacterSet.alphanumerics
+            cs.insert(charactersIn: "-._~")
+            req.httpBody = fields.map { k, v in
+                "\(k)=\(v.addingPercentEncoding(withAllowedCharacters: cs) ?? v)"
+            }.joined(separator: "&").data(using: .utf8)
+        } else {
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.httpBody = try? JSONSerialization.data(withJSONObject: fields)
+        }
+        req.timeoutInterval = timeout
+        let sem = DispatchSemaphore(value: 0)
+        var body: [String: Any]?
+        var code = -1
+        URLSession.shared.dataTask(with: req) { d, resp, _ in
+            code = (resp as? HTTPURLResponse)?.statusCode ?? -1
+            if let d = d { body = try? JSONSerialization.jsonObject(with: d) as? [String: Any] }
+            sem.signal()
+        }.resume()
+        _ = sem.wait(timeout: .now() + timeout + 5)
+        return (code, body)
+    }
+
+    // The CLI's encoding for this grant isn't observable from the outside, so try JSON and
+    // fall back to form once if the server rejects the content type.
+    var (httpStatus, answer) = post(form: false)
+    if httpStatus == 400 || httpStatus == 415 || httpStatus == 422 {
+        log("token refresh: retrying form-encoded (HTTP \(httpStatus))")
+        (httpStatus, answer) = post(form: true)
+    }
+
+    guard httpStatus == 200, let answer = answer,
+          let access = answer["access_token"] as? String, !access.isEmpty else {
+        if httpStatus == 429 {
+            refreshLock.lock()
+            refreshBlockedUntil[service] = Date().addingTimeInterval(3600)
+            refreshLock.unlock()
+        }
+        log("token refresh for \(service) failed (HTTP \(httpStatus)) — nothing written")
+        return nil
+    }
+
+    backupCredentialBlob(service: service, blob: blob)
+    oauth["accessToken"] = access
+    if let rotated = answer["refresh_token"] as? String, !rotated.isEmpty {
+        oauth["refreshToken"] = rotated      // rotated: losing this would sign the user out
+    }
+    if let expiresIn = (answer["expires_in"] as? NSNumber)?.doubleValue {
+        oauth["expiresAt"] = NSNumber(value: Date().addingTimeInterval(expiresIn).timeIntervalSince1970 * 1000)
+    }
+    if key.isEmpty { root = oauth } else { root[key] = oauth }
+    guard let out = try? JSONSerialization.data(withJSONObject: root),
+          let text = String(data: out, encoding: .utf8),
+          writeCredentialBlob(service: service, blob: text) else { return nil }
+
+    log("refreshed access token for \(service)")
+    return readCredentials(service: service)
+}
+
+/// Returns credentials that are good to use, refreshing first if the stored access token is
+/// expired or about to be. Claude Code only refreshes when it is actually run, so a
+/// subscription you aren't actively using would otherwise sit stale for days.
+func usableCredentials(service: String) -> Credentials? {
+    guard let creds = readCredentials(service: service) else { return nil }
+    guard let expiry = creds.expiresAt else { return creds }   // no expiry recorded; use as-is
+    if expiry.timeIntervalSinceNow > kRefreshLeadTime { return creds }
+    if let refreshed = refreshAccessToken(service: service) { return refreshed }
+    return expiry > Date() ? creds : nil     // refresh failed; use it only if still valid
 }
 
 // MARK: - Finding a profile's keychain entry

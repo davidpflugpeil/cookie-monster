@@ -4,6 +4,27 @@ All notable changes to Cookie Monster are documented here. The format is based o
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.7.0] — 2026-10-12
+
+### Added
+- **Tokens are refreshed automatically — no more re-running the CLI.** Claude Code
+  refreshes its access token only when you actually run it, so a subscription you
+  aren't actively using goes stale within hours. Cookie Monster now performs the
+  same OAuth refresh grant itself (`platform.claude.com/v1/oauth/token`, using
+  Claude Code's own client id read from the installed binary) and writes the
+  result back to the same keychain entry, so the CLI sees the fresh token too.
+
+  **This is the first time the app writes to your keychain**, and it only does so
+  on a successful `200` carrying a new access token. The previous blob is copied
+  to `~/.cookie-monster/keychain-backups/` before every write, because OAuth
+  servers commonly rotate refresh tokens and losing the rotated one would sign
+  that profile out. Writes go through `SecItemUpdate`, never the `security` CLI,
+  so no secret ever appears in a process argument list.
+
+  Refreshes are throttled to one attempt per profile per 5 minutes, and a `429`
+  parks that profile's refresh for an hour — a refresh storm is precisely how this
+  app has burned quota before.
+
 ## [0.6.2] — 2026-10-10
 
 ### Fixed
