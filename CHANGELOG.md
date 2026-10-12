@@ -4,6 +4,16 @@ All notable changes to Cookie Monster are documented here. The format is based o
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.7.2] — 2026-10-12
+
+### Fixed
+- **Token refresh now actually works — wrong endpoint.** 0.7.0 posted the refresh
+  grant to `platform.claude.com/v1/oauth/token`, which appears in the Claude Code
+  binary but answers `429` to every POST regardless of input (confirmed with a
+  deliberately invalid token). The endpoint that validates the grant is
+  `api.anthropic.com/v1/oauth/token` — it answers `400 invalid_grant` to a bad
+  token and refreshes correctly with a real one.
+
 ## [0.7.1] — 2026-10-12
 
 ### Fixed

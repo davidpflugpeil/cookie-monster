@@ -26,7 +26,7 @@ let kRefreshLeadTime: TimeInterval = 1800
 let kSignedOutBackoff: TimeInterval = 3600
 let kLogDir = (cmHome() as NSString).appendingPathComponent(".cookie-monster")
 let kLogFile = (kLogDir as NSString).appendingPathComponent("cookie-monster.log")
-let kVersion = "0.7.1"
+let kVersion = "0.7.2"
 
 // MARK: - Logging (no secrets ever pass through here)
 
@@ -663,7 +663,10 @@ func shellSnippetInstalled() -> Bool {
 
 // MARK: - Refreshing an expired access token
 
-let kOAuthTokenURL = URL(string: "https://platform.claude.com/v1/oauth/token")!
+/// Confirmed by probing with a deliberately invalid refresh token: this endpoint answers
+/// 400 `invalid_grant` (i.e. it validated the grant), whereas platform.claude.com/v1/oauth/token
+/// — which also appears in the CLI binary — answers 429 to every POST regardless of input.
+let kOAuthTokenURL = URL(string: "https://api.anthropic.com/v1/oauth/token")!
 /// Claude Code's own OAuth client id, read out of the installed binary rather than guessed.
 let kOAuthClientID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 let kKeychainBackupDir = (kLogDir as NSString).appendingPathComponent("keychain-backups")
