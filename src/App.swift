@@ -105,6 +105,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var profileAuth: [String: AuthStatus] = [:]     // keyed by config dir
     var lastActiveProfile: [Provider: String] = [:]
     var lastSwitchAt: [Provider: Date] = [:]        // debounces the switch click
+    var openCards: [Provider: InfoCardView] = [:]   // live cards, updated in place
     var claudeGeneration = 0                 // discards fetches issued for a previous profile
     var discoveryAttemptedAt: [String: Date] = [:]  // throttles the keychain search
     var profileUsage: [String: ProviderUsage] = [:]   // usage per profile, for the switcher
@@ -270,12 +271,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     self.claudeEmail = nil
                     self.resolveClaudeEmail(creds)
                 }
-                let email = prof.isDefault ? self.claudeEmail : self.profileAuth[dir]?.email
+                // For a non-default profile prefer what the TOKEN says over `claude auth
+                // status`, which mirrors ~/.claude.json and has named the wrong account here.
+                let email = prof.isDefault ? self.claudeEmail
+                                           : (boundAccount(dir) ?? self.profileAuth[dir]?.email)
                 fetchClaudeUsage(creds: creds, email: email) { result in
                     DispatchQueue.main.async {
                         switch result {
                         case .ok(let u):
                             self.profileUsage[dir] = u
+                            if !prof.isDefault, boundAccount(dir) == nil, let e = u.email {
+                                bindAccount(dir, email: e)   // token-derived, so authoritative
+                            }
                         case .rateLimited(let until):
                             self.profileBlocked[dir] = until
                         case .tokenExpired:
@@ -514,8 +521,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // landing while the dropdown is open would otherwise leave it frozen on the
         // old snapshot (including a stale "Updated 3m ago" ticking off a stale date).
         guard rebuildOpenMenu, menuIsOpen else { return }
-        menu.removeAllItems()
-        populate(menu)
+        // Rebuilding a menu that is being tracked replaces the card views under the pointer,
+        // and AppKit then delivers the pending click to the replacement. Update what the
+        // cards show instead; the full rebuild happens on the next open.
+        for p in Provider.allCases { openCards[p]?.updateAccounts(switcherAccounts(p)) }
+        liveRefreshers.forEach { $0() }
     }
 
     func renderButton() {
@@ -591,6 +601,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func populate(_ menu: NSMenu) {
         liveRefreshers.removeAll()
+        openCards.removeAll()
 
         let providers = activeProviders
         if providers.isEmpty {
@@ -690,6 +701,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard profiles.count > 1 else { return [] }
         let active = activeProfileDir(provider)
         let pinned = Prefs.pinnedID
+        var seen: [String: String] = [:]      // account -> first profile holding it
         return profiles.map { prof in
             let usage = profileUsage[prof.configDir]
             let pct = usage?.metrics.first { $0.id == pinned }?.pct ?? usage?.metrics.first?.pct
@@ -703,6 +715,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                bound.caseInsensitiveCompare(now) != .orderedSame {
                 label = "\(prof.name) — signed in as \(now)"   // never silently relabel
             }
+            if let account = account, !prof.isDefault,
+               let dup = seen[account.lowercased()] {
+                // Two profiles on one account look like two subscriptions but aren't — say so
+                // rather than letting the user believe they are switching between plans.
+                label = "\(prof.name) — same account as \(dup)"
+            }
+            if let account = account { seen[account.lowercased()] = prof.name }
             return InfoCardView.Account(dir: prof.configDir, label: label, pct: pct,
                                         active: prof.configDir == active)
         }
@@ -720,6 +739,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         entry.isEnabled = true
         entry.view = card
         liveRefreshers.append { [weak card] in card?.refresh() }
+        openCards[p] = card
         menu.addItem(entry)
     }
 
@@ -753,6 +773,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         cardItem.isEnabled = true
         cardItem.view = card
         liveRefreshers.append { [weak card] in card?.refresh() }
+        openCards[p] = card
         menu.addItem(cardItem)
     }
 
@@ -911,8 +932,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard setActiveProfile(provider, dir) else { return }
         log("active \(provider.rawValue) profile set → \(dir)")
         refresh()
-        // Defer the rebuild so the current event finishes dispatching first.
-        DispatchQueue.main.async { [weak self] in self?.render() }
+        renderButton()
+        // In place, never a rebuild: the menu stays exactly as it is, so no view is replaced
+        // under the cursor and no click can be re-delivered.
+        for p in Provider.allCases { openCards[p]?.updateAccounts(switcherAccounts(p)) }
     }
 
     @objc func setProfile(_ sender: NSMenuItem) {
@@ -1069,7 +1092,7 @@ final class InfoCardView: NSView {
 
     private let title: String
     private let email: String?
-    private let accounts: [Account]
+    private var accounts: [Account]
     private let onSwitch: (String) -> Void
     private let note: () -> String?
     private let rows: [Row]
@@ -1091,7 +1114,15 @@ final class InfoCardView: NSView {
     }
     required init?(coder: NSCoder) { fatalError() }
     override var isFlipped: Bool { true }        // lay out top→down
-    func refresh() { needsDisplay = true }        // recompute countdowns / "Updated …" on redraw
+    func refresh() { needsDisplay = true }
+
+    /// Swap in new switcher data without rebuilding the menu. Rebuilding replaces this view
+    /// while the menu is tracking, and the replacement receives the in-flight click — which
+    /// is what made a selection flip back a second or two later.
+    func updateAccounts(_ next: [Account]) {
+        accounts = next
+        needsDisplay = true
+    }        // recompute countdowns / "Updated …" on redraw
 
     // Clicking a usage row pins it to the menu bar, then closes the menu.
     override func mouseDown(with event: NSEvent) {

@@ -4,6 +4,21 @@ All notable changes to Cookie Monster are documented here. The format is based o
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.7.5] — 2026-10-13
+
+### Fixed
+- **Selecting a subscription no longer flips back.** Every `render()` rebuilt the
+  open menu — including the one fired when a usage fetch returned — and rebuilding
+  a menu that is being tracked replaces the card under the pointer, so AppKit
+  delivered the pending click to the replacement. The card now takes new switcher
+  data in place; the full rebuild waits for the next open.
+- **Two profiles holding the same account say so.** They previously looked like two
+  separate subscriptions showing near-identical numbers. The row now reads
+  `<name> — same account as <other>`.
+- **A profile is bound once it reports successfully**, using the account its own
+  token resolves to. Profiles matched by the sign-in-time correlation recorded a
+  keychain entry but were never bound, so they stayed unlabelled indefinitely.
+
 ## [0.7.3] — 2026-10-13
 
 ### Fixed
