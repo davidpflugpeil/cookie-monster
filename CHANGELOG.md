@@ -4,6 +4,16 @@ All notable changes to Cookie Monster are documented here. The format is based o
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.7.3] — 2026-10-13
+
+### Fixed
+- **Selecting a subscription appeared not to switch.** It did switch, then flipped
+  straight back about a second later. Rebuilding the menu from inside the click
+  handler re-creates the card while the event is still being dispatched, so the
+  replacement view received the same click and switched again. The rebuild is now
+  deferred to the next run-loop pass, and a second switch arriving within 600 ms —
+  faster than a person can click twice — is ignored.
+
 ## [0.7.2] — 2026-10-12
 
 ### Fixed

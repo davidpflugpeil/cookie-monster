@@ -104,6 +104,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var menuIsOpen = false                   // drives the in-place rebuild in render()
     var profileAuth: [String: AuthStatus] = [:]     // keyed by config dir
     var lastActiveProfile: [Provider: String] = [:]
+    var lastSwitchAt: [Provider: Date] = [:]        // debounces the switch click
     var claudeGeneration = 0                 // discards fetches issued for a previous profile
     var discoveryAttemptedAt: [String: Date] = [:]  // throttles the keychain search
     var profileUsage: [String: ProviderUsage] = [:]   // usage per profile, for the switcher
@@ -899,11 +900,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func switchProfile(_ provider: Provider, to dir: String) {
+        // Rebuilding the menu from inside the click handler re-creates the card while the
+        // event is still being dispatched, and the replacement view receives the same click —
+        // which looked like the selection flipping back a second later. Ignore a second
+        // switch that arrives faster than a person can click twice.
+        if let last = lastSwitchAt[provider], Date().timeIntervalSince(last) < 0.6 { return }
+        lastSwitchAt[provider] = Date()
+
         if dir != provider.defaultConfigDir { syncProfile(provider, dir) }
         guard setActiveProfile(provider, dir) else { return }
         log("active \(provider.rawValue) profile set → \(dir)")
         refresh()
-        render()
+        // Defer the rebuild so the current event finishes dispatching first.
+        DispatchQueue.main.async { [weak self] in self?.render() }
     }
 
     @objc func setProfile(_ sender: NSMenuItem) {
