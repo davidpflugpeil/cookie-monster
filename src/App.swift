@@ -704,7 +704,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         var seen: [String: String] = [:]      // account -> first profile holding it
         return profiles.map { prof in
             let usage = profileUsage[prof.configDir]
-            let pct = usage?.metrics.first { $0.id == pinned }?.pct ?? usage?.metrics.first?.pct
+            let metrics = usage?.metrics ?? []
+            let pinnedMetric = metrics.first { $0.id == pinned } ?? metrics.first
+            let pct = pinnedMetric?.pct
+            // The longest window that isn't the pinned one — the two rarely coincide.
+            let secondary = metrics.last { $0.id != pinnedMetric?.id }?.pct
             let bound = prof.isDefault ? nil : boundAccount(prof.configDir)
             let signedInAs = profileAuth[prof.configDir]?.email
             let account = bound ?? signedInAs ?? usage?.email
@@ -723,6 +727,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             if let account = account { seen[account.lowercased()] = prof.name }
             return InfoCardView.Account(dir: prof.configDir, label: label, pct: pct,
+                                        secondary: secondary,
                                         active: prof.configDir == active)
         }
     }
@@ -1088,7 +1093,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 final class InfoCardView: NSView {
     struct Row { let id: String; let name: String; let pct: Double; let resets: Date? }
     /// One switchable subscription, with the pinned metric's value for that account.
-    struct Account { let dir: String; let label: String; let pct: Double?; let active: Bool }
+    struct Account {
+        let dir: String; let label: String
+        let pct: Double?        // the pinned metric
+        let secondary: Double?  // the next window, so two accounts can't look identical
+        let active: Bool
+    }
 
     private let title: String
     private let email: String?
@@ -1179,16 +1189,27 @@ final class InfoCardView: NSView {
                     let dot = NSRect(x: x, y: y + 4, width: 6, height: 6)
                     (a.active ? NSColor.controlAccentColor : NSColor.quaternaryLabelColor).setFill()
                     NSBezierPath(ovalIn: dot).fill()
+                    // Two subscriptions often sit at a similar value on one window, so show
+                    // the next one too — otherwise identical numbers read as a bug.
+                    var valueWidth: CGFloat = 0
+                    if let second = a.secondary {
+                        let secondText = t(String(format: "%.0f%%", second),
+                                           .monospacedDigitSystemFont(ofSize: 11, weight: .regular),
+                                           .tertiaryLabelColor)
+                        right(secondText, w - x, y + 1)
+                        valueWidth = secondText.size().width + 7
+                    }
                     let value = a.pct.map { String(format: "%.0f%%", $0) } ?? "—"
                     let valueText = t(value,
                                       .monospacedDigitSystemFont(ofSize: 12, weight: a.active ? .bold : .regular),
                                       a.pct == nil ? .tertiaryLabelColor
                                                    : (a.active ? .labelColor : .secondaryLabelColor))
-                    right(valueText, w - x, y)
+                    right(valueText, w - x - valueWidth, y)
+                    valueWidth += valueText.size().width
                     // Clip the label to the space left over, so renaming to something long
                     // can never overlap the number.
                     let labelX = x + 14
-                    let avail = (w - x) - valueText.size().width - 10 - labelX
+                    let avail = (w - x) - valueWidth - 10 - labelX
                     let para = NSMutableParagraphStyle()
                     para.lineBreakMode = .byTruncatingTail
                     NSAttributedString(string: a.label, attributes: [

@@ -4,6 +4,15 @@ All notable changes to Cookie Monster are documented here. The format is based o
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.7.6] — 2026-10-14
+
+### Fixed
+- **Two subscriptions could show the same number and look broken.** The switcher
+  showed only the pinned metric, and two accounts often sit at a similar value on
+  one window — e.g. both at 9% session while their weekly usage was 35% and 17%.
+  Each row now shows the pinned metric plus the next window, so distinct accounts
+  are visibly distinct.
+
 ## [0.7.5] — 2026-10-13
 
 ### Fixed
