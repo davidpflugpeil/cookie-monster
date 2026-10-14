@@ -26,7 +26,7 @@ let kRefreshLeadTime: TimeInterval = 1800
 let kSignedOutBackoff: TimeInterval = 3600
 let kLogDir = (cmHome() as NSString).appendingPathComponent(".cookie-monster")
 let kLogFile = (kLogDir as NSString).appendingPathComponent("cookie-monster.log")
-let kVersion = "0.7.6"
+let kVersion = "0.7.7"
 
 // MARK: - Logging (no secrets ever pass through here)
 
@@ -174,24 +174,69 @@ func versionLess(_ a: String, _ b: String) -> Bool {
 
 /// Reads the raw credential blob from the login keychain via `/usr/bin/security`.
 /// May trigger a one-time macOS "allow access" prompt on first use.
+/// Reads a keychain item's secret IN-PROCESS. This used to spawn /usr/bin/security, so
+/// every read was attributed to "security": an "Always Allow" granted that Apple tool rather
+/// than this app, and the grant kept getting knocked out — which meant a password prompt on
+/// every poll. Read in-process, a grant binds to Cookie Monster's code signature (team ID
+/// under Developer ID) and survives updates.
 func keychainBlob(service: String = kKeychainService) -> String? {
-    let p = Process()
-    p.executableURL = URL(fileURLWithPath: "/usr/bin/security")
-    p.arguments = ["find-generic-password", "-s", service, "-w"]
-    let out = Pipe()
-    p.standardOutput = out
-    p.standardError = Pipe()
-    do { try p.run() } catch { return nil }
-    let data = out.fileHandleForReading.readDataToEndOfFile()
-    p.waitUntilExit()
-    guard p.terminationStatus == 0 else { return nil }
+    let q: [String: Any] = [
+        kSecClass as String: kSecClassGenericPassword,
+        kSecAttrService as String: service,
+        kSecMatchLimit as String: kSecMatchLimitOne,
+        kSecReturnData as String: true,
+    ]
+    var out: CFTypeRef?
+    guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess,
+          let data = out as? Data else { return nil }
     return String(data: data, encoding: .utf8)?
         .trimmingCharacters(in: .whitespacesAndNewlines)
 }
 
-func readCredentials(service: String = kKeychainService) -> Credentials? {
-    guard let blob = keychainBlob(service: service), !blob.isEmpty else { return nil }
+/// The item's modification date. Attributes only — nothing is decrypted, so macOS never
+/// prompts for this, and it is how we tell whether the secret actually changed.
+func keychainModDate(service: String) -> Date? {
+    let q: [String: Any] = [
+        kSecClass as String: kSecClassGenericPassword,
+        kSecAttrService as String: service,
+        kSecMatchLimit as String: kSecMatchLimitOne,
+        kSecReturnAttributes as String: true,
+    ]
+    var out: CFTypeRef?
+    guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess,
+          let a = out as? [String: Any] else { return nil }
+    return a[kSecAttrModificationDate as String] as? Date
+}
 
+private let credCacheLock = NSLock()
+private var credCache: [String: (modDate: Date, creds: Credentials)] = [:]
+
+/// Drop a cached secret, e.g. after we've written a new one ourselves.
+func invalidateCredentials(service: String) {
+    credCacheLock.lock(); credCache[service] = nil; credCacheLock.unlock()
+}
+
+/// Reads credentials, touching the secret only when the keychain item has actually changed.
+/// Every poll does a silent attributes check; the decrypting read — the only thing that can
+/// prompt — happens when Claude Code refreshes or the user signs in again, a few times a
+/// day, instead of every couple of minutes. A re-login changes the item, so a switched
+/// account is still picked up on the very next poll.
+func readCredentials(service: String = kKeychainService) -> Credentials? {
+    guard let mod = keychainModDate(service: service) else { return nil }   // item gone
+    credCacheLock.lock()
+    if let hit = credCache[service], hit.modDate == mod {
+        credCacheLock.unlock()
+        return hit.creds
+    }
+    credCacheLock.unlock()
+
+    guard let blob = keychainBlob(service: service), !blob.isEmpty,
+          let creds = parseCredentials(blob) else { return nil }
+    credCacheLock.lock(); credCache[service] = (mod, creds); credCacheLock.unlock()
+    return creds
+}
+
+func parseCredentials(_ blob: String) -> Credentials? {
     if let data = blob.data(using: .utf8),
        let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
         let oauth = (root["claudeAiOauth"] as? [String: Any]) ?? root
@@ -786,6 +831,7 @@ func refreshAccessToken(service: String, timeout: TimeInterval = 20) -> Credenti
           writeCredentialBlob(service: service, blob: text) else { return nil }
 
     log("refreshed access token for \(service)")
+    invalidateCredentials(service: service)
     return readCredentials(service: service)
 }
 

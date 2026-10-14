@@ -4,6 +4,25 @@ All notable changes to Cookie Monster are documented here. The format is based o
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.7.7] — 2026-10-14
+
+### Fixed
+- **Constant keychain password prompts.** The app read your Claude credentials by
+  spawning `/usr/bin/security` on every poll, so each read was attributed to that
+  Apple tool rather than to Cookie Monster — an "Always Allow" granted `security`,
+  and since 0.7.0's token write-back the grant kept getting knocked out, which
+  meant a prompt every few minutes.
+  - Credentials are now read **in-process** via the Security framework, so a grant
+    binds to Cookie Monster's own signature.
+  - The secret is read **only when the keychain item actually changed**. Each poll
+    does a silent attributes-only check of the item's modification date; the
+    decrypting read — the only thing that can prompt — happens when Claude Code
+    refreshes or you sign in again, a few times a day. A re-login still changes the
+    item, so a switched account is picked up on the next poll.
+  - Local builds are signed with your Developer ID when one is installed. Ad-hoc
+    signatures change on every build, and macOS ties "Always Allow" to the
+    signature, so every rebuild used to void the grant.
+
 ## [0.7.6] — 2026-10-14
 
 ### Fixed
