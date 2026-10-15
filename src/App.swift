@@ -310,6 +310,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    /// The keychain entries the app genuinely needs and has been refused.
+    func neededDeniedServices() -> [String] {
+        let denied = keychainDeniedServices()
+        guard !denied.isEmpty else { return [] }
+        var needed = [kKeychainService]
+        for prof in listProfiles(.claude) where !prof.isDefault {
+            if let s = recordedKeychainService(prof.configDir) { needed.append(s) }
+        }
+        return needed.filter { denied.contains($0) }
+    }
+
+    /// The only place a keychain dialog can come from, and only on an explicit click.
+    @objc func allowKeychainAccess() {
+        let services = neededDeniedServices()
+        guard !services.isEmpty else { return }
+        let alert = NSAlert()
+        alert.messageText = "Allow Cookie Monster to read your Claude sign-in?"
+        alert.informativeText = "macOS will ask \(services.count == 1 ? "once" : "\(services.count) times — once per subscription"). "
+            + "Choose \u{201C}Always Allow\u{201D} each time.\n\n"
+            + "Cookie Monster never asks on its own — this only happens because you clicked."
+        alert.addButton(withTitle: "Continue")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        DispatchQueue.global(qos: .userInitiated).async {
+            _ = requestKeychainAccess(services: services)
+            DispatchQueue.main.async { self.refresh(); self.render() }
+        }
+    }
+
     /// One silent keychain search per profile per launch; see discoverKeychainService.
     private func attemptDiscovery(_ prof: Profile) {
         let dir = prof.configDir
@@ -617,6 +647,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             disabled(menu, "⚠︎ Shell setup not installed", bold: true)
             disabled(menu, "Switching won't affect `claude`, and signing in will overwrite", bold: false)
             disabled(menu, "your default profile. Use Install Shell Setup.", bold: false)
+        }
+        if !neededDeniedServices().isEmpty {
+            menu.addItem(.separator())
+            disabled(menu, "⚠︎ Claude sign-in not readable", bold: true)
+            disabled(menu, "Cookie Monster won't ask on its own.", bold: false)
+            menu.addItem(item("Allow Keychain Access…", #selector(allowKeychainAccess), ""))
         }
         menu.addItem(.separator())
         menu.addItem(item("Refresh Now", #selector(refreshClicked), "r"))
@@ -1290,6 +1326,9 @@ final class InfoCardView: NSView {
 @main
 struct CookieMonsterApp {
     static func main() {
+        // Before anything can touch the keychain: this app never shows a keychain dialog on
+        // its own. See disableKeychainPrompts().
+        disableKeychainPrompts()
         logHandler = fileLog
         let app = NSApplication.shared
         let delegate = AppDelegate()

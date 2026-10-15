@@ -21,12 +21,11 @@ let kInactiveProfileInterval: TimeInterval = 900
 let kDiscoveryRetryInterval: TimeInterval = 600
 /// Refresh this long before the access token actually expires, so a poll never lands on a
 /// dead token. Claude Code issues ~8h tokens.
-let kRefreshLeadTime: TimeInterval = 1800
 /// A 401 can only be fixed by a human signing in, so stop asking for a while.
 let kSignedOutBackoff: TimeInterval = 3600
 let kLogDir = (cmHome() as NSString).appendingPathComponent(".cookie-monster")
 let kLogFile = (kLogDir as NSString).appendingPathComponent("cookie-monster.log")
-let kVersion = "0.7.7"
+let kVersion = "0.7.8"
 
 // MARK: - Logging (no secrets ever pass through here)
 
@@ -174,23 +173,80 @@ func versionLess(_ a: String, _ b: String) -> Bool {
 
 /// Reads the raw credential blob from the login keychain via `/usr/bin/security`.
 /// May trigger a one-time macOS "allow access" prompt on first use.
-/// Reads a keychain item's secret IN-PROCESS. This used to spawn /usr/bin/security, so
-/// every read was attributed to "security": an "Always Allow" granted that Apple tool rather
-/// than this app, and the grant kept getting knocked out — which meant a password prompt on
-/// every poll. Read in-process, a grant binds to Cookie Monster's code signature (team ID
-/// under Developer ID) and survives updates.
-func keychainBlob(service: String = kKeychainService) -> String? {
-    let q: [String: Any] = [
+// MARK: - Keychain access that can never show a dialog
+
+/// The app must never put a keychain dialog in front of the user on its own. Every poll used
+/// to start a read that WAITED on its own prompt, so a night of polling stacked dozens of
+/// dialogs that all appeared on wake. Interaction is now disabled for the whole process at
+/// launch, and every read also asks the Security framework to fail rather than prompt. A read
+/// we are not authorised for returns nil immediately; the only way a dialog can appear is the
+/// user clicking "Allow Keychain Access…" in the menu.
+func disableKeychainPrompts() {
+    SecKeychainSetUserInteractionAllowed(false)
+}
+
+private let kcLock = NSLock()
+private var kcDenied: Set<String> = []
+private var kcGrantInProgress = false
+
+/// Services we were refused silently, so the menu can offer the one explicit fix.
+func keychainDeniedServices() -> Set<String> {
+    kcLock.lock(); defer { kcLock.unlock() }
+    return kcDenied
+}
+
+private func rawKeychainRead(service: String, allowUI: Bool) -> (OSStatus, Data?) {
+    var q: [String: Any] = [
         kSecClass as String: kSecClassGenericPassword,
         kSecAttrService as String: service,
         kSecMatchLimit as String: kSecMatchLimitOne,
         kSecReturnData as String: true,
     ]
+    if !allowUI { q[kSecUseAuthenticationUI as String] = kSecUseAuthenticationUIFail }
     var out: CFTypeRef?
-    guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess,
-          let data = out as? Data else { return nil }
+    let status = SecItemCopyMatching(q as CFDictionary, &out)
+    return (status, out as? Data)
+}
+
+/// Reads a keychain item's secret in-process, never prompting. A refusal is remembered and
+/// not retried automatically — retrying is what produced the pile of dialogs.
+func keychainBlob(service: String = kKeychainService) -> String? {
+    kcLock.lock()
+    let skip = kcDenied.contains(service) || kcGrantInProgress
+    kcLock.unlock()
+    if skip { return nil }
+
+    let (status, data) = rawKeychainRead(service: service, allowUI: false)
+    if status == errSecInteractionNotAllowed || status == errSecAuthFailed {
+        kcLock.lock(); let isNew = kcDenied.insert(service).inserted; kcLock.unlock()
+        if isNew { log("keychain: not authorised for \(service) — not prompting") }
+        return nil
+    }
+    guard status == errSecSuccess, let data = data else { return nil }
     return String(data: data, encoding: .utf8)?
         .trimmingCharacters(in: .whitespacesAndNewlines)
+}
+
+/// The ONLY code path allowed to show a keychain dialog, and only ever called from an
+/// explicit click. Asks once per service, serially, then turns prompts off again.
+func requestKeychainAccess(services: [String]) -> Int {
+    kcLock.lock(); kcGrantInProgress = true; kcLock.unlock()
+    SecKeychainSetUserInteractionAllowed(true)
+    defer {
+        SecKeychainSetUserInteractionAllowed(false)
+        kcLock.lock(); kcGrantInProgress = false; kcLock.unlock()
+    }
+    var granted = 0
+    for service in services {
+        let (status, _) = rawKeychainRead(service: service, allowUI: true)
+        if status == errSecSuccess {
+            granted += 1
+            kcLock.lock(); kcDenied.remove(service); kcLock.unlock()
+            invalidateCredentials(service: service)
+        }
+    }
+    log("keychain access granted for \(granted)/\(services.count)")
+    return granted
 }
 
 /// The item's modification date. Attributes only — nothing is decrypted, so macOS never
@@ -706,147 +762,18 @@ func shellSnippetInstalled() -> Bool {
     return false
 }
 
-// MARK: - Refreshing an expired access token
+// MARK: - No keychain writes, ever
 
-/// Confirmed by probing with a deliberately invalid refresh token: this endpoint answers
-/// 400 `invalid_grant` (i.e. it validated the grant), whereas platform.claude.com/v1/oauth/token
-/// — which also appears in the CLI binary — answers 429 to every POST regardless of input.
-let kOAuthTokenURL = URL(string: "https://api.anthropic.com/v1/oauth/token")!
-/// Claude Code's own OAuth client id, read out of the installed binary rather than guessed.
-let kOAuthClientID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-let kKeychainBackupDir = (kLogDir as NSString).appendingPathComponent("keychain-backups")
+// 0.7.0 refreshed expired tokens and wrote them back to Claude Code's keychain item. Two apps
+// writing one item is what caused the prompt storms: on macOS the last writer can lock the
+// other out, so each Claude Code refresh made Cookie Monster prompt and each Cookie Monster
+// refresh made Claude Code prompt. This app now never writes to the keychain. Claude Code
+// refreshes its own token whenever it runs; an expired token here is shown as such, and the
+// usage call short-circuits so no request is made with it.
 
-/// Keeps a copy of a credential blob before we overwrite it. OAuth servers commonly rotate
-/// refresh tokens, so a failed or raced write-back can cost the user their sign-in; this is
-/// the difference between "restore the backup" and "log in again".
-private func backupCredentialBlob(service: String, blob: String) {
-    try? FileManager.default.createDirectory(atPath: kKeychainBackupDir, withIntermediateDirectories: true)
-    let safe = slug(service)
-    let path = (kKeychainBackupDir as NSString).appendingPathComponent("\(safe).json")
-    try? blob.write(toFile: path, atomically: true, encoding: .utf8)
-    try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path)
-}
-
-/// Writes a credential blob back to its keychain item. Uses SecItemUpdate rather than the
-/// `security` CLI so the secret never appears in a process argument list.
-private func writeCredentialBlob(service: String, blob: String) -> Bool {
-    guard let data = blob.data(using: .utf8) else { return false }
-    let query: [String: Any] = [
-        kSecClass as String: kSecClassGenericPassword,
-        kSecAttrService as String: service,
-    ]
-    let status = SecItemUpdate(query as CFDictionary,
-                               [kSecValueData as String: data] as CFDictionary)
-    if status != errSecSuccess { log("keychain write failed for \(service): \(status)") }
-    return status == errSecSuccess
-}
-
-/// Exchanges the refresh token for a fresh access token, the same grant Claude Code uses.
-/// Returns the updated credentials, having persisted them so the CLI sees them too — the
-/// server may rotate the refresh token, and dropping the new one would sign the user out.
-private let refreshLock = NSLock()
-private var refreshBlockedUntil: [String: Date] = [:]
-
-func refreshAccessToken(service: String, timeout: TimeInterval = 20) -> Credentials? {
-    // The token endpoint rate-limits like everything else here. One attempt per service per
-    // five minutes, and a 429 parks it for an hour — a refresh storm is how this app has
-    // burned the user's quota before.
-    refreshLock.lock()
-    if let until = refreshBlockedUntil[service], Date() < until { refreshLock.unlock(); return nil }
-    refreshBlockedUntil[service] = Date().addingTimeInterval(300)
-    refreshLock.unlock()
-
-    guard let blob = keychainBlob(service: service), let data = blob.data(using: .utf8),
-          var root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
-    let key = root["claudeAiOauth"] != nil ? "claudeAiOauth" : ""
-    var oauth = (root["claudeAiOauth"] as? [String: Any]) ?? root
-    guard let refresh = oauth["refreshToken"] as? String, !refresh.isEmpty else { return nil }
-    if let ms = (oauth["refreshTokenExpiresAt"] as? NSNumber)?.doubleValue,
-       Date(timeIntervalSince1970: ms / 1000) <= Date() {
-        log("refresh token itself has expired for \(service)")
-        return nil
-    }
-
-    let fields = ["grant_type": "refresh_token", "refresh_token": refresh,
-                  "client_id": kOAuthClientID]
-    func post(form: Bool) -> (Int, [String: Any]?) {
-        var req = URLRequest(url: kOAuthTokenURL)
-        req.httpMethod = "POST"
-        req.setValue("claude-code/\(claudeCodeVersion())", forHTTPHeaderField: "User-Agent")
-        req.setValue("application/json", forHTTPHeaderField: "Accept")
-        if form {
-            req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
-            var cs = CharacterSet.alphanumerics
-            cs.insert(charactersIn: "-._~")
-            req.httpBody = fields.map { k, v in
-                "\(k)=\(v.addingPercentEncoding(withAllowedCharacters: cs) ?? v)"
-            }.joined(separator: "&").data(using: .utf8)
-        } else {
-            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            req.httpBody = try? JSONSerialization.data(withJSONObject: fields)
-        }
-        req.timeoutInterval = timeout
-        let sem = DispatchSemaphore(value: 0)
-        var body: [String: Any]?
-        var code = -1
-        URLSession.shared.dataTask(with: req) { d, resp, _ in
-            code = (resp as? HTTPURLResponse)?.statusCode ?? -1
-            if let d = d { body = try? JSONSerialization.jsonObject(with: d) as? [String: Any] }
-            sem.signal()
-        }.resume()
-        _ = sem.wait(timeout: .now() + timeout + 5)
-        return (code, body)
-    }
-
-    // The CLI's encoding for this grant isn't observable from the outside, so try JSON and
-    // fall back to form once if the server rejects the content type.
-    var (httpStatus, answer) = post(form: false)
-    if httpStatus == 400 || httpStatus == 415 || httpStatus == 422 {
-        log("token refresh: retrying form-encoded (HTTP \(httpStatus))")
-        (httpStatus, answer) = post(form: true)
-    }
-
-    guard httpStatus == 200, let answer = answer,
-          let access = answer["access_token"] as? String, !access.isEmpty else {
-        if httpStatus == 429 {
-            refreshLock.lock()
-            refreshBlockedUntil[service] = Date().addingTimeInterval(3600)
-            refreshLock.unlock()
-        }
-        log("token refresh for \(service) failed (HTTP \(httpStatus)) — nothing written")
-        return nil
-    }
-
-    backupCredentialBlob(service: service, blob: blob)
-    oauth["accessToken"] = access
-    if let rotated = answer["refresh_token"] as? String, !rotated.isEmpty {
-        oauth["refreshToken"] = rotated      // rotated: losing this would sign the user out
-    }
-    if let expiresIn = (answer["expires_in"] as? NSNumber)?.doubleValue {
-        oauth["expiresAt"] = NSNumber(value: Date().addingTimeInterval(expiresIn).timeIntervalSince1970 * 1000)
-    }
-    if key.isEmpty { root = oauth } else { root[key] = oauth }
-    guard let out = try? JSONSerialization.data(withJSONObject: root),
-          let text = String(data: out, encoding: .utf8),
-          writeCredentialBlob(service: service, blob: text) else { return nil }
-
-    log("refreshed access token for \(service)")
-    invalidateCredentials(service: service)
-    return readCredentials(service: service)
-}
-
-/// Returns credentials that are good to use, refreshing first if the stored access token is
-/// expired or about to be. Claude Code only refreshes when it is actually run, so a
-/// subscription you aren't actively using would otherwise sit stale for days.
+/// Returns the stored credentials as-is. Read-only by design — see "No keychain writes".
 func usableCredentials(service: String) -> Credentials? {
-    guard let creds = readCredentials(service: service) else { return nil }
-    guard let expiry = creds.expiresAt else { return creds }   // no expiry recorded; use as-is
-    if expiry.timeIntervalSinceNow > kRefreshLeadTime { return creds }
-    if let refreshed = refreshAccessToken(service: service) { return refreshed }
-    // Refresh failed (rate limited, offline, revoked). Hand back the stale credentials
-    // anyway: fetchClaudeUsage short-circuits on expiry without making a request, so the
-    // card can say "token expired" instead of the profile silently vanishing.
-    return creds
+    readCredentials(service: service)
 }
 
 // MARK: - Finding a profile's keychain entry
@@ -982,7 +909,7 @@ func discoverKeychainService(profileDir: String, expectedEmail: String?,
         candidates.first { abs($0.created.timeIntervalSince(stamp)) < 300 }
     }
     // Newest first: the right entry is the one written when the profile was last signed in.
-    for candidate in candidates.prefix(8) {
+    for candidate in candidates.prefix(8) where !keychainDeniedServices().contains(candidate.service) {
         guard let creds = readCredentials(service: candidate.service) else { continue }
         let sem = DispatchSemaphore(value: 0)
         var found: String?

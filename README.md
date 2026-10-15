@@ -63,7 +63,9 @@ Codex-only setups both show a single section.
 2. Open the `.dmg` and drag **Cookie Monster** into **Applications**.
 3. **Double-click to open** — release builds are **signed & notarized by Apple**,
    so there's no Gatekeeper warning.
-4. macOS will ask to allow keychain access — click **Always Allow**.
+4. Cookie Monster never shows a keychain prompt on its own. If it can't read your
+   Claude sign-in, the menu says so and offers **Allow Keychain Access…** — the
+   only thing that can bring up a dialog, and only when you click it.
 5. Enable auto-start from the 🍪 menu → **Start at Login**.
 
 ### Build from source
@@ -96,13 +98,12 @@ display.
 Both are polled every 60 seconds (configurable). The pinned window's percentage
 goes in the bar, color-coded green < 50%, orange < 80%, red ≥ 80%.
 
-**Credentials:** the app reads your existing tokens and, since 0.7.0, refreshes an
-expired Claude access token using the standard OAuth refresh grant — writing the
-result back to the same keychain entry so Claude Code sees it too. That write is
-the only one it makes: it happens only on a successful refresh, the previous blob
-is backed up to `~/.cookie-monster/keychain-backups/` first, and it goes through
-`SecItemUpdate` so no secret reaches a command line. `~/.codex/auth.json` is still
-never written. A token or raw API response is never logged. A small diagnostic log (status codes + percentages
+**Credentials:** read-only. The app reads your existing tokens in-process with
+keychain UI disabled, so a read it isn't allowed to make fails silently instead of
+prompting. It never writes to the keychain and never writes `~/.codex/auth.json`.
+(0.7.0–0.7.7 refreshed tokens and wrote them back; that rewrite locked Claude Code
+out of its own item and caused prompt storms — see the 0.7.8 changelog entry.)
+A token or raw API response is never logged. A small diagnostic log (status codes + percentages
 only) is kept at `~/.cookie-monster/cookie-monster.log`.
 
 ## Settings
@@ -145,8 +146,8 @@ copied settings — check it before removing the directory, and delete the
   window clears — so there is nothing to do but wait.
 - **Token refresh:** if a section shows *not signed in*, that provider's OAuth
   token expired — run `claude` or `codex` once to refresh it, then click
-  **Refresh Now**. Cookie Monster intentionally does not refresh tokens itself,
-  to avoid ever touching your stored credentials.
+  **Refresh Now**. Cookie Monster does not refresh tokens itself: refresh tokens
+  rotate, so doing it would mean writing to Claude Code's keychain item.
 - Both usage endpoints are **undocumented** and may change without notice. If the
   numbers stop appearing, check the field names in [`src/Core.swift`](src/Core.swift)
   (`five_hour` / `seven_day` / `seven_day_opus` / `seven_day_sonnet` for Claude,

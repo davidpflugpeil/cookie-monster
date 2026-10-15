@@ -4,6 +4,25 @@ All notable changes to Cookie Monster are documented here. The format is based o
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.7.8] — 2026-10-15
+
+### Fixed
+- **Keychain prompt storms — for Cookie Monster and for Claude Code itself.**
+  0.7.0–0.7.7 refreshed expired Claude tokens and wrote them back to Claude Code's
+  keychain item. On macOS, modifying an item replaces its access partition with
+  the writer's, so each write removed `apple-tool:` — the partition of
+  `/usr/bin/security`, which Claude Code uses to read its own sign-in. From then on
+  every Claude Code session prompted on every read (the system log shows
+  `ACL partition mismatch: client apple-tool:`).
+  - The app **never writes to the keychain**. The refresh/write-back code is gone,
+    not switched off; the binary contains no `SecItemUpdate`/`SecItemAdd`/`SecItemDelete`.
+  - Reads run with keychain UI disabled (`SecKeychainSetUserInteractionAllowed(false)`,
+    `kSecUseAuthenticationUIFail`). A refused read is remembered and not retried;
+    the menu offers **Allow Keychain Access…**, the only path that can show a dialog.
+  - **Repairing an item damaged by an earlier version** (run once per item; it asks
+    for your login password in the terminal, not in a dialog):
+    `security set-generic-password-partition-list -S "apple-tool:,apple:,teamid:29T68WB833" -s "Claude Code-credentials"`
+
 ## [0.7.7] — 2026-10-14
 
 ### Fixed

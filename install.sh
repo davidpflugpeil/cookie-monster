@@ -17,5 +17,5 @@ sleep 0.3
 open "$DEST/Cookie Monster.app"
 
 echo "✓ Cookie Monster is running — look for 🍪 in your menu bar."
-echo "  First launch: macOS will ask to allow keychain access — click \"Always Allow\"."
+echo "  It never shows keychain prompts by itself; if it can't read your sign-in, use the menu's \"Allow Keychain Access…\"."
 echo "  Enable auto-start from the 🍪 menu → \"Start at Login\"."
