@@ -25,7 +25,7 @@ let kDiscoveryRetryInterval: TimeInterval = 600
 let kSignedOutBackoff: TimeInterval = 3600
 let kLogDir = (cmHome() as NSString).appendingPathComponent(".cookie-monster")
 let kLogFile = (kLogDir as NSString).appendingPathComponent("cookie-monster.log")
-let kVersion = "0.7.8"
+let kVersion = "0.7.9"
 
 // MARK: - Logging (no secrets ever pass through here)
 
@@ -33,8 +33,12 @@ let kVersion = "0.7.8"
 var logHandler: (String) -> Void = { _ in }
 func log(_ msg: String) { logHandler(msg) }
 
-/// A file logger the menu-bar app installs into `logHandler`.
+private let fileLogLock = NSLock()
+
+/// A file logger the menu-bar app installs into `logHandler`. Serialised: pollers log from
+/// several threads, and two unsynchronised appends can overwrite each other.
 func fileLog(_ msg: String) {
+    fileLogLock.lock(); defer { fileLogLock.unlock() }
     let fm = FileManager.default
     if !fm.fileExists(atPath: kLogDir) {
         try? fm.createDirectory(atPath: kLogDir, withIntermediateDirectories: true)
@@ -171,8 +175,6 @@ func versionLess(_ a: String, _ b: String) -> Bool {
 
 // MARK: - Claude credentials (login keychain)
 
-/// Reads the raw credential blob from the login keychain via `/usr/bin/security`.
-/// May trigger a one-time macOS "allow access" prompt on first use.
 // MARK: - Keychain access that can never show a dialog
 
 /// The app must never put a keychain dialog in front of the user on its own. Every poll used
@@ -186,13 +188,20 @@ func disableKeychainPrompts() {
 }
 
 private let kcLock = NSLock()
-private var kcDenied: Set<String> = []
-private var kcGrantInProgress = false
+/// Service → the item modification date we last failed to read it at. A refused item is
+/// retried only once it has changed, so polling never hammers it.
+private var kcDenied: [String: Date] = [:]
+/// Service → modification date at which the secret was readable but not credentials JSON.
+private var kcUnparsable: [String: Date] = [:]
+/// Every secret read — and the explicit grant — runs under this lock, one at a time. Two
+/// pollers can then never start two `security` runs (two dialogs) for one item, and a poll
+/// can't slip in while the user is answering a grant.
+private let secretReadLock = NSLock()
 
-/// Services we were refused silently, so the menu can offer the one explicit fix.
+/// Services we currently can't read without asking, so the menu can offer the one explicit fix.
 func keychainDeniedServices() -> Set<String> {
     kcLock.lock(); defer { kcLock.unlock() }
-    return kcDenied
+    return Set(kcDenied.keys)
 }
 
 private func rawKeychainRead(service: String, allowUI: Bool) -> (OSStatus, Data?) {
@@ -208,41 +217,223 @@ private func rawKeychainRead(service: String, allowUI: Bool) -> (OSStatus, Data?
     return (status, out as? Data)
 }
 
-/// Reads a keychain item's secret in-process, never prompting. A refusal is remembered and
-/// not retried automatically — retrying is what produced the pile of dialogs.
-func keychainBlob(service: String = kKeychainService) -> String? {
-    kcLock.lock()
-    let skip = kcDenied.contains(service) || kcGrantInProgress
-    kcLock.unlock()
-    if skip { return nil }
+/// Reads a keychain item's secret without ever prompting, trying two silent routes.
+///
+/// 1. In-process, with UI disabled. Works when Cookie Monster itself is on the item's access
+///    list — but Claude Code rewrites the item whenever it refreshes its token, and a rewrite
+///    can drop a grant given to another app.
+/// 2. `/usr/bin/security`, the tool Claude Code itself reads and writes the item with. Claude
+///    Code's own writes keep that tool on the access list (otherwise Claude Code couldn't
+///    read its own sign-in), so this route survives refreshes. A subprocess can't have its UI
+///    switched off, so it is only started after the item's access list — read without
+///    decrypting anything — shows the tool is allowed in silently; and a run that hasn't
+///    finished in 3 s (silent reads take milliseconds) is killed and never retried.
+private let kSecurityTool = "/usr/bin/security"
 
+enum SecretRead { case value(String), refused, unavailable }
+
+func keychainBlob(service: String = kKeychainService) -> SecretRead {
     let (status, data) = rawKeychainRead(service: service, allowUI: false)
-    if status == errSecInteractionNotAllowed || status == errSecAuthFailed {
-        kcLock.lock(); let isNew = kcDenied.insert(service).inserted; kcLock.unlock()
-        if isNew { log("keychain: not authorised for \(service) — not prompting") }
-        return nil
+    if status == errSecSuccess, let data = data {
+        let blob = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return blob.map { $0.isEmpty ? .unavailable : .value($0) } ?? .unavailable
     }
-    guard status == errSecSuccess, let data = data else { return nil }
-    return String(data: data, encoding: .utf8)?
-        .trimmingCharacters(in: .whitespacesAndNewlines)
+    guard status == errSecInteractionNotAllowed || status == errSecAuthFailed else { return .unavailable }
+    switch securityToolRead(service: service) {
+    case .value(let blob): return .value(blob)
+    case .refused: return .refused
+    case .transient: return .unavailable     // e.g. keychain locked: try again next poll
+    }
+}
+
+/// The keychain item for `service`, as a reference plus its account. Attributes only.
+private func keychainItemRef(service: String, keychain: SecKeychain?) -> (SecKeychainItem, String)? {
+    var q: [String: Any] = [
+        kSecClass as String: kSecClassGenericPassword,
+        kSecAttrService as String: service,
+        kSecMatchLimit as String: kSecMatchLimitOne,
+        kSecReturnRef as String: true,
+        kSecReturnAttributes as String: true,
+    ]
+    if let keychain = keychain { q[kSecMatchSearchList as String] = [keychain] }
+    var out: CFTypeRef?
+    guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess,
+          let attrs = out as? [String: Any], let ref = attrs[kSecValueRef as String],
+          CFGetTypeID(ref as CFTypeRef) == SecKeychainItemGetTypeID() else { return nil }
+    return (ref as! SecKeychainItem, attrs[kSecAttrAccount as String] as? String ?? "")
+}
+
+/// The partition IDs in a `partition_id` ACL entry's description: a hex-encoded plist
+/// `{Partitions = (...)}` (older systems store the plist as plain text).
+func partitionIDs(fromACLDescription desc: String) -> [String]? {
+    var bytes = Data()
+    var i = desc.startIndex
+    while let j = desc.index(i, offsetBy: 2, limitedBy: desc.endIndex), i < desc.endIndex {
+        guard let b = UInt8(desc[i..<j], radix: 16) else { bytes = Data(); break }
+        bytes.append(b); i = j
+    }
+    if bytes.isEmpty, let plain = desc.data(using: .utf8) { bytes = plain }
+    let plist = try? PropertyListSerialization.propertyList(from: bytes, format: nil)
+    return (plist as? [String: Any])?["Partitions"] as? [String]
+}
+
+/// One entry of a keychain item's access list, reduced to what decides whether a dialog appears.
+struct KeychainACLEntry {
+    var authorizations: [String]
+    var apps: [String]?           // nil = any application
+    var requiresPassphrase = false
+    var partitions: [String]?     // only for the partition_id entry; nil = unreadable
+}
+
+/// The decision behind securityToolCanReadSilently, kept pure so it can be tested without a
+/// keychain. "No" whenever anything is unclear: a wrong "no" costs a reading, a wrong "yes"
+/// costs the user a dialog.
+func toolMaySilentlyDecrypt(_ entries: [KeychainACLEntry], tool: String = "/usr/bin/security") -> Bool {
+    var partitionOK = true      // an item with no partition entry predates partitions
+    var decision: Bool?         // set by the FIRST entry that authorises decryption
+    for e in entries {
+        if e.authorizations.contains(kSecACLAuthorizationPartitionID as String) {
+            partitionOK = e.partitions?.contains("apple-tool:") ?? false
+            continue
+        }
+        guard decision == nil,
+              e.authorizations.contains(kSecACLAuthorizationDecrypt as String)
+              || e.authorizations.contains(kSecACLAuthorizationAny as String) else { continue }
+        // securityd works through the entries in order and the first decrypt entry that
+        // doesn't admit the caller puts up its dialog — so that entry alone decides.
+        decision = !e.requiresPassphrase && (e.apps?.contains(tool) ?? true)
+    }
+    return partitionOK && (decision ?? false)
+}
+
+enum ToolVerdict { case silent, wouldPrompt, locked }
+
+func securityToolCanReadSilently(service: String, keychain: SecKeychain? = nil) -> Bool {
+    securityToolVerdict(service: service, keychain: keychain) == .silent
+}
+
+/// Whether `/usr/bin/security` can decrypt the item with no dialog at all. Reads only the
+/// item's access list — the same information Keychain Access shows without a password — so
+/// it can't prompt. `.locked` is kept apart because it passes: it must not be remembered
+/// as a refusal.
+func securityToolVerdict(service: String, keychain: SecKeychain? = nil) -> ToolVerdict {
+    guard let (item, _) = keychainItemRef(service: service, keychain: keychain) else { return .wouldPrompt }
+    // A locked keychain makes the tool ask for the keychain password, whatever the ACL says.
+    var owner: SecKeychain?
+    var lockState = SecKeychainStatus()
+    guard SecKeychainItemCopyKeychain(item, &owner) == errSecSuccess, let owner = owner,
+          SecKeychainGetStatus(owner, &lockState) == errSecSuccess else { return .wouldPrompt }
+    guard lockState & SecKeychainStatus(kSecUnlockStateStatus) != 0 else { return .locked }
+    var access: SecAccess?
+    guard SecKeychainItemCopyAccess(item, &access) == errSecSuccess, let access = access else { return .wouldPrompt }
+    var list: CFArray?
+    guard SecAccessCopyACLList(access, &list) == errSecSuccess,
+          let acls = list as? [SecACL] else { return .wouldPrompt }
+    let entries = acls.map { acl -> KeychainACLEntry in
+        let auths = (SecACLCopyAuthorizations(acl) as? [String]) ?? []
+        var apps: CFArray?
+        var desc: CFString?
+        var selector = SecKeychainPromptSelector()
+        guard SecACLCopyContents(acl, &apps, &desc, &selector) == errSecSuccess else {
+            // Unreadable: claim nothing, and make an unreadable partition entry fail closed.
+            return KeychainACLEntry(authorizations: auths, apps: [], requiresPassphrase: true,
+                                    partitions: nil)
+        }
+        let paths = (apps as? [SecTrustedApplication])?.map { app -> String in
+            var data: CFData?
+            guard SecTrustedApplicationCopyData(app, &data) == errSecSuccess,
+                  let d = data as Data? else { return "" }
+            return String(decoding: d.prefix { $0 != 0 }, as: UTF8.self)
+        }
+        return KeychainACLEntry(authorizations: auths, apps: apps == nil ? nil : (paths ?? []),
+                                requiresPassphrase: selector.contains(.requirePassphase),
+                                partitions: desc.flatMap { partitionIDs(fromACLDescription: $0 as String) })
+    }
+    return toolMaySilentlyDecrypt(entries) ? .silent : .wouldPrompt
+}
+
+private func toolBlockedPath() -> String {
+    (cmHome() as NSString).appendingPathComponent(".cookie-monster/keychain-tool-blocked")
+}
+
+/// Items the tool must never be started for again: a run once needed a dialog. Permanent on
+/// purpose, and kept on disk so a relaunch — or a second copy of the app — honours it.
+/// Delete ~/.cookie-monster/keychain-tool-blocked to reset.
+private func toolBlockedOnDisk() -> Set<String> {
+    let raw = (try? String(contentsOfFile: toolBlockedPath(), encoding: .utf8)) ?? ""
+    return Set(raw.split(separator: "\n").map(String.init))
+}
+
+private func blockTool(_ service: String, _ why: String) {
+    kcLock.lock(); defer { kcLock.unlock() }
+    let all = toolBlockedOnDisk().union([service])      // union: never drop another's entry
+    try? FileManager.default.createDirectory(atPath: (toolBlockedPath() as NSString)
+        .deletingLastPathComponent, withIntermediateDirectories: true)
+    try? all.sorted().joined(separator: "\n").write(toFile: toolBlockedPath(),
+                                                    atomically: true, encoding: .utf8)
+    log("keychain: \(kSecurityTool) \(why) for \(service) — never using it for that item again")
+}
+
+enum ToolRead { case value(String), refused, transient }
+
+/// Route 2 of keychainBlob. Only a clean run — exit 0 with output, well under a second —
+/// counts as silent. Anything else from a run that did start means a dialog may have been
+/// involved, so the item is blocked for good. `keychain` is for tests only.
+func securityToolRead(service: String, keychain: String? = nil) -> ToolRead {
+    guard !toolBlockedOnDisk().contains(service) else { return .refused }
+    let kcRef: SecKeychain? = keychain.flatMap { path in
+        var k: SecKeychain?
+        return SecKeychainOpen(path, &k) == errSecSuccess ? k : nil
+    }
+    switch securityToolVerdict(service: service, keychain: kcRef) {
+    case .locked: return .transient
+    case .wouldPrompt: return .refused
+    case .silent: break
+    }
+    guard let (_, account) = keychainItemRef(service: service, keychain: kcRef) else { return .transient }
+    var args = ["find-generic-password", "-s", service, "-a", account, "-w"]
+    if let keychain = keychain { args.append(keychain) }
+    let run = runBoundedResult(kSecurityTool, args, env: [:], timeout: 3, watchForDialog: true)
+    if run.launchFailed { return .transient }                   // nothing could have shown
+    if run.timedOut { blockTool(service, "didn't answer within 3 s"); return .refused }
+    // Hard evidence only: a keychain dialog was on screen while it ran. Slowness alone
+    // (e.g. just after wake) is not evidence, and blocking on it would cost the item.
+    if run.dialogSeen { blockTool(service, "ran while a keychain dialog was up") }
+    let blob = run.data.flatMap { String(data: $0, encoding: .utf8) }?
+        .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    if run.status == 44 { return .transient }                   // item vanished meanwhile
+    // -1: output arrived but the exit wasn't reported in time — the output is what counts.
+    guard run.status == 0 || (run.status == -1 && !blob.isEmpty) else {
+        blockTool(service, "exited \(run.status)"); return .refused
+    }
+    return blob.isEmpty ? .transient : .value(blob)
 }
 
 /// The ONLY code path allowed to show a keychain dialog, and only ever called from an
 /// explicit click. Asks once per service, serially, then turns prompts off again.
 func requestKeychainAccess(services: [String]) -> Int {
-    kcLock.lock(); kcGrantInProgress = true; kcLock.unlock()
+    secretReadLock.lock()
     SecKeychainSetUserInteractionAllowed(true)
     defer {
         SecKeychainSetUserInteractionAllowed(false)
-        kcLock.lock(); kcGrantInProgress = false; kcLock.unlock()
+        secretReadLock.unlock()
     }
     var granted = 0
     for service in services {
-        let (status, _) = rawKeychainRead(service: service, allowUI: true)
+        kcLock.lock(); let stillDenied = kcDenied[service] != nil; kcLock.unlock()
+        guard stillDenied else { continue }          // a read in the meantime already worked
+        let mod = keychainModDate(service: service)
+        let (status, data) = rawKeychainRead(service: service, allowUI: true)
         if status == errSecSuccess {
             granted += 1
-            kcLock.lock(); kcDenied.remove(service); kcLock.unlock()
-            invalidateCredentials(service: service)
+            kcLock.lock(); kcDenied[service] = nil; kcLock.unlock()
+            // Keep what was just read: a one-time "Allow" must still produce a reading.
+            if let mod = mod, let blob = data.flatMap({ String(data: $0, encoding: .utf8) }),
+               let creds = parseCredentials(blob.trimmingCharacters(in: .whitespacesAndNewlines)) {
+                credCacheLock.lock(); credCache[service] = (mod, creds); credCacheLock.unlock()
+            } else {
+                invalidateCredentials(service: service)
+            }
         }
     }
     log("keychain access granted for \(granted)/\(services.count)")
@@ -278,18 +469,47 @@ func invalidateCredentials(service: String) {
 /// day, instead of every couple of minutes. A re-login changes the item, so a switched
 /// account is still picked up on the very next poll.
 func readCredentials(service: String = kKeychainService) -> Credentials? {
-    guard let mod = keychainModDate(service: service) else { return nil }   // item gone
-    credCacheLock.lock()
-    if let hit = credCache[service], hit.modDate == mod {
-        credCacheLock.unlock()
-        return hit.creds
+    guard let mod = keychainModDate(service: service) else {          // item gone
+        kcLock.lock(); kcDenied[service] = nil; kcUnparsable[service] = nil; kcLock.unlock()
+        return nil
     }
-    credCacheLock.unlock()
+    func cached() -> Credentials? {
+        credCacheLock.lock(); defer { credCacheLock.unlock() }
+        if let hit = credCache[service], hit.modDate == mod { return hit.creds }
+        return nil
+    }
+    if let hit = cached() { return hit }
+    func unchanged() -> Bool {              // same item we already couldn't use
+        kcLock.lock(); defer { kcLock.unlock() }
+        return kcDenied[service] == mod || kcUnparsable[service] == mod
+    }
+    if unchanged() { return nil }
 
-    guard let blob = keychainBlob(service: service), !blob.isEmpty,
-          let creds = parseCredentials(blob) else { return nil }
-    credCacheLock.lock(); credCache[service] = (mod, creds); credCacheLock.unlock()
-    return creds
+    // Busy (another read, or the user answering a grant): skip this poll rather than park a
+    // thread behind it — the next poll tries again.
+    guard secretReadLock.lock(before: Date().addingTimeInterval(5)) else { return nil }
+    defer { secretReadLock.unlock() }
+    if let hit = cached() { return hit }    // another thread read it while we waited
+    if unchanged() { return nil }
+
+    switch keychainBlob(service: service) {
+    case .refused:
+        kcLock.lock(); let isNew = kcDenied.updateValue(mod, forKey: service) == nil; kcLock.unlock()
+        if isNew { log("keychain: can't read \(service) without asking — not prompting") }
+        return nil
+    case .unavailable:
+        return nil
+    case .value(let blob):
+        kcLock.lock(); kcDenied[service] = nil; kcLock.unlock()
+        guard let creds = parseCredentials(blob) else {
+            kcLock.lock(); kcUnparsable[service] = mod; kcLock.unlock()
+            log("keychain: \(service) doesn't hold Claude credentials")
+            return nil
+        }
+        kcLock.lock(); kcUnparsable[service] = nil; kcLock.unlock()
+        credCacheLock.lock(); credCache[service] = (mod, creds); credCacheLock.unlock()
+        return creds
+    }
 }
 
 func parseCredentials(_ blob: String) -> Credentials? {
@@ -312,6 +532,17 @@ func parseCredentials(_ blob: String) -> Credentials? {
     return nil
 }
 
+/// JSON that may hold a lone UTF-16 surrogate escape (Claude Code has written one into
+/// history text), which JSONSerialization rejects outright. Retry with those escapes
+/// replaced by U+FFFD; nothing else is touched.
+func parseJSONTolerantly(_ data: Data) -> Any? {
+    if let v = try? JSONSerialization.jsonObject(with: data) { return v }
+    guard let text = String(data: data, encoding: .utf8) else { return nil }
+    let lone = #"\\u[dD][89abAB][0-9a-fA-F]{2}(?!\\u[dD][c-fC-F][0-9a-fA-F]{2})|(?<!\\u[dD][89abAB][0-9a-fA-F]{2})\\u[dD][c-fC-F][0-9a-fA-F]{2}"#
+    let fixed = text.replacingOccurrences(of: lone, with: #"\\ufffd"#, options: .regularExpression)
+    return fixed.data(using: .utf8).flatMap { try? JSONSerialization.jsonObject(with: $0) }
+}
+
 /// The account Claude Code's *config* file names — used only as a diagnostic, never as
 /// the displayed email. Claude Code keeps a credential store per config/session, so this
 /// can name a different account than the keychain token we actually poll with (seen in
@@ -320,7 +551,7 @@ func parseCredentials(_ blob: String) -> Credentials? {
 /// The `path` parameter exists so tests can point at a fixture.
 func readClaudeAccount(path: String = kClaudeConfigPath) -> (email: String, uuid: String?)? {
     guard let data = FileManager.default.contents(atPath: path),
-          let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let root = parseJSONTolerantly(data) as? [String: Any],
           let acct = root["oauthAccount"] as? [String: Any],
           let email = acct["emailAddress"] as? String, !email.isEmpty else { return nil }
     return (email, acct["accountUuid"] as? String)
@@ -612,6 +843,35 @@ codex() {
 /// background process inheriting stdout keeps the pipe open long after the shell exits.
 func runBounded(_ executable: String, _ args: [String], env: [String: String]?,
                 timeout: TimeInterval) -> Data? {
+    runBoundedResult(executable, args, env: env, timeout: timeout).data
+}
+
+struct BoundedRun {
+    var data: Data?
+    var launchFailed = false
+    var timedOut = false
+    var status: Int32 = -1          // -1 when it didn't exit in time to be read
+    var elapsed: TimeInterval = 0
+    var dialogSeen = false          // SecurityAgent (keychain dialogs) was running meanwhile
+}
+
+/// Whether macOS is showing a keychain dialog right now — SecurityAgent only runs then.
+func keychainDialogShowing() -> Bool {
+    let n = proc_listallpids(nil, 0)
+    guard n > 0 else { return false }
+    var pids = [pid_t](repeating: 0, count: Int(n) + 64)
+    let got = proc_listallpids(&pids, Int32(pids.count * MemoryLayout<pid_t>.size))
+    var name = [CChar](repeating: 0, count: 256)
+    for pid in pids.prefix(Int(max(got, 0))) where pid > 0 {
+        if proc_name(pid, &name, UInt32(name.count)) > 0,
+           String(cString: name) == "SecurityAgent" { return true }
+    }
+    return false
+}
+
+/// runBounded with the details the keychain route needs to judge a run.
+func runBoundedResult(_ executable: String, _ args: [String], env: [String: String]?,
+                      timeout: TimeInterval, watchForDialog: Bool = false) -> BoundedRun {
     final class Box { var data = Data() }
     let box = Box()
     let p = Process()
@@ -622,90 +882,54 @@ func runBounded(_ executable: String, _ args: [String], env: [String: String]?,
     p.standardOutput = out
     p.standardError = FileHandle.nullDevice
     p.standardInput = FileHandle.nullDevice
-    do { try p.run() } catch { return nil }
+    let exited = DispatchSemaphore(value: 0)
+    p.terminationHandler = { _ in exited.signal() }
+    let started = Date()
+    do { try p.run() } catch { return BoundedRun(launchFailed: true) }
     let done = DispatchSemaphore(value: 0)
-    DispatchQueue.global(qos: .utility).async {
+    // Its own thread, not the shared pool: a starved pool would look like a hung child.
+    Thread {
         box.data = out.fileHandleForReading.readDataToEndOfFile()
         done.signal()
+    }.start()
+    // A silent read finishes in milliseconds; while one is still going, look for a dialog.
+    var dialogSeen = false
+    var finished = false
+    let deadline = Date().addingTimeInterval(timeout)
+    while !finished {
+        let slice = watchForDialog ? 0.2 : timeout
+        if done.wait(timeout: .now() + slice) == .success { finished = true; break }
+        if watchForDialog, keychainDialogShowing() { dialogSeen = true }
+        if Date() >= deadline { break }
     }
-    if done.wait(timeout: .now() + timeout) == .timedOut {
-        p.terminate()
+    if !finished {
+        kill(p.processIdentifier, SIGKILL)
         _ = done.wait(timeout: .now() + 2)
         DispatchQueue.global(qos: .utility).async { p.waitUntilExit() }
         log("timed out running \((executable as NSString).lastPathComponent)")
-        return nil
+        return BoundedRun(timedOut: true, elapsed: Date().timeIntervalSince(started),
+                          dialogSeen: dialogSeen)
     }
-    DispatchQueue.global(qos: .utility).async { p.waitUntilExit() }
-    return box.data
+    let status: Int32 = exited.wait(timeout: .now() + 2) == .success ? p.terminationStatus : -1
+    return BoundedRun(data: box.data, status: status, elapsed: Date().timeIntervalSince(started),
+                      dialogSeen: dialogSeen)
 }
 
-private let cliPathLock = NSLock()
-private var cachedCLIPaths: [String: String] = [:]
-private var cliPathCheckedAt: [String: Date] = [:]
-
-/// Locates a provider's CLI. npm/nvm installs live only on the user's PATH, so fall back to
-/// an INTERACTIVE login shell (-i): zsh and bash source ~/.zshrc / ~/.bashrc only for those.
-func cliPath(_ provider: Provider) -> String? {
-    cliPathLock.lock(); defer { cliPathLock.unlock() }
-    let name = provider.cliName
-    if let hit = cachedCLIPaths[name] {
-        if FileManager.default.isExecutableFile(atPath: hit) { return hit }
-        cachedCLIPaths[name] = nil; cliPathCheckedAt[name] = nil
-    }
-    // Never cache a miss for the process lifetime: the user may install the CLI while we run.
-    if let at = cliPathCheckedAt[name], Date().timeIntervalSince(at) < 300 { return nil }
-    let home = cmHome() as NSString
-    var candidates = [
-        home.appendingPathComponent(".local/bin/" + name), "/opt/homebrew/bin/" + name,
-        "/usr/local/bin/" + name, home.appendingPathComponent(".bun/bin/" + name),
-        home.appendingPathComponent(".npm-global/bin/" + name),
-    ]
-    if provider == .codex { candidates.append("/Applications/ChatGPT.app/Contents/Resources/codex") }
-    var found = candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
-    if found == nil { found = whichViaLoginShell(name) }
-    cliPathCheckedAt[name] = Date()
-    cachedCLIPaths[name] = found
-    return found
-}
-
-func claudeCLIPath() -> String? { cliPath(.claude) }
-
-private func whichViaLoginShell(_ name: String) -> String? {
-    let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
-    // `unset -f` matters: once our own shell function is installed, `command -v` answers with
-    // the function name rather than a path.
-    guard let data = runBounded(shell, ["-ilc", "unset -f \(name) 2>/dev/null; command -v \(name)"],
-                                env: nil, timeout: 10),
-          let text = String(data: data, encoding: .utf8) else { return nil }
-    let path = text.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }
-        .last { !$0.isEmpty } ?? ""
-    guard path.hasPrefix("/"), FileManager.default.isExecutableFile(atPath: path) else { return nil }
-    return path
-}
-
-/// `claude auth status` answers differently under CLAUDE_CODE_USE_BEDROCK or an ANTHROPIC_*
-/// override — loggedIn with no email — so strip anything that redirects auth before asking.
-func claudeProbeEnv(configDir: String?) -> [String: String] {
-    var env = ProcessInfo.processInfo.environment
-    for key in env.keys where key.hasPrefix("ANTHROPIC_") || key.hasPrefix("CLAUDE_CODE_")
-        || key == "CLAUDE_CONFIG_DIR" { env.removeValue(forKey: key) }
-    // Setting CLAUDE_CONFIG_DIR at all keys a different keychain entry — even when set to
-    // ~/.claude itself, which then reads as signed out. The default profile means *unset*.
-    if let dir = configDir { env["CLAUDE_CONFIG_DIR"] = dir }
-    return env
-}
-
-/// Pass nil for the default profile. `email` is often null — Claude Code mirrors
-/// ~/.claude.json's oauthAccount there — so callers must not treat that as signed out.
-func claudeAuthStatus(configDir: String?, timeout: TimeInterval = 15) -> AuthStatus? {
-    guard let cli = claudeCLIPath() else { return nil }
-    guard let data = runBounded(cli, ["auth", "status"],
-                                env: claudeProbeEnv(configDir: configDir), timeout: timeout),
-          let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
-    return AuthStatus(loggedIn: (root["loggedIn"] as? Bool) ?? false,
-                      email: root["email"] as? String,
-                      plan: root["subscriptionType"] as? String,
-                      orgName: root["orgName"] as? String)
+/// A profile's sign-in state from files alone — no process, no secret. This used to run
+/// `claude auth status` per profile on every poll, and Claude Code answers that by reading the
+/// keychain through /usr/bin/security with dialogs allowed: a background poll must never start
+/// anything that can do that. The email is what `auth status` reported anyway (it mirrors
+/// oauthAccount in the profile's config); signed in means a keychain entry exists for it.
+func claudeProfileIdentity(_ prof: Profile) -> AuthStatus? {
+    let cfg = prof.isDefault ? kClaudeConfigPath
+                             : (prof.configDir as NSString).appendingPathComponent(".claude.json")
+    let email = readClaudeAccount(path: cfg)?.email
+    let service = prof.isDefault ? kKeychainService : recordedKeychainService(prof.configDir)
+    let hasEntry = service.map { keychainModDate(service: $0) != nil } ?? false
+    // An unreadable config with no known entry is "don't know", not "signed out".
+    if email == nil, !hasEntry, FileManager.default.fileExists(atPath: cfg),
+       parseJSONTolerantly(FileManager.default.contents(atPath: cfg) ?? Data()) == nil { return nil }
+    return AuthStatus(loggedIn: hasEntry || email != nil, email: email, plan: nil, orgName: nil)
 }
 
 /// The exact command that signs a *specific* profile in. Without this, `claude /login` goes
@@ -909,7 +1133,7 @@ func discoverKeychainService(profileDir: String, expectedEmail: String?,
         candidates.first { abs($0.created.timeIntervalSince(stamp)) < 300 }
     }
     // Newest first: the right entry is the one written when the profile was last signed in.
-    for candidate in candidates.prefix(8) where !keychainDeniedServices().contains(candidate.service) {
+    for candidate in candidates.prefix(8) {
         guard let creds = readCredentials(service: candidate.service) else { continue }
         let sem = DispatchSemaphore(value: 0)
         var found: String?
@@ -926,6 +1150,8 @@ func discoverKeychainService(profileDir: String, expectedEmail: String?,
             bindAccount(profileDir, email: email)
         }
         guard assertInsideProfiles(profileDir) else { return nil }
+        // Another profile may have claimed it while we were verifying.
+        guard !claimedKeychainServices(excluding: profileDir).contains(candidate.service) else { continue }
         try? candidate.service.write(toFile: serviceRecordPath(profileDir),
                                      atomically: true, encoding: .utf8)
         log("profile \((profileDir as NSString).lastPathComponent): entry for \(email) found")
@@ -1035,6 +1261,9 @@ func rateLimitedState(_ http: HTTPURLResponse, _ data: Data?, _ who: String) -> 
     return .rateLimited(Date().addingTimeInterval(wait))
 }
 
+/// Ephemeral: URLSession.shared keeps an on-disk cache, and these requests carry bearer tokens.
+let kHTTP = URLSession(configuration: .ephemeral)
+
 // MARK: - Claude fetch
 
 func fetchClaudeUsage(creds: Credentials, email: String?, completion: @escaping (FetchState) -> Void) {
@@ -1053,7 +1282,7 @@ func fetchClaudeUsage(creds: Credentials, email: String?, completion: @escaping 
     req.setValue("application/json", forHTTPHeaderField: "Accept")
     req.timeoutInterval = 20
 
-    URLSession.shared.dataTask(with: req) { data, resp, err in
+    kHTTP.dataTask(with: req) { data, resp, err in
         if let err = err {
             log("claude fetch error: \(err.localizedDescription)")
             completion(.error(err.localizedDescription)); return
@@ -1102,7 +1331,7 @@ func fetchAccountEmail(creds: Credentials, completion: @escaping (String?) -> Vo
     req.setValue("claude-code/\(claudeCodeVersion())", forHTTPHeaderField: "User-Agent")
     req.setValue("application/json", forHTTPHeaderField: "Accept")
     req.timeoutInterval = 20
-    URLSession.shared.dataTask(with: req) { data, resp, _ in
+    kHTTP.dataTask(with: req) { data, resp, _ in
         guard (resp as? HTTPURLResponse)?.statusCode == 200, let data = data,
               let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let email = root["email_address"] as? String, !email.isEmpty else {
@@ -1126,7 +1355,7 @@ func fetchCodexUsage(creds: CodexCredentials, completion: @escaping (FetchState)
     req.setValue("application/json", forHTTPHeaderField: "Accept")
     req.timeoutInterval = 20
 
-    URLSession.shared.dataTask(with: req) { data, resp, err in
+    kHTTP.dataTask(with: req) { data, resp, err in
         if let err = err {
             log("codex fetch error: \(err.localizedDescription)")
             completion(.error(err.localizedDescription)); return

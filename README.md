@@ -100,7 +100,11 @@ goes in the bar, color-coded green < 50%, orange < 80%, red ≥ 80%.
 
 **Credentials:** read-only. The app reads your existing tokens in-process with
 keychain UI disabled, so a read it isn't allowed to make fails silently instead of
-prompting. It never writes to the keychain and never writes `~/.codex/auth.json`.
+prompting. When the app itself isn't allowed — Claude Code's token refreshes reset the
+item's access — it reads through `/usr/bin/security`, the tool Claude Code itself uses,
+but only after the item's access list (checked without decrypting anything) shows that
+read can't show a dialog. It never writes to the keychain and never writes
+`~/.codex/auth.json`.
 (0.7.0–0.7.7 refreshed tokens and wrote them back; that rewrite locked Claude Code
 out of its own item and caused prompt storms — see the 0.7.8 changelog entry.)
 A token or raw API response is never logged. A small diagnostic log (status codes + percentages

@@ -4,6 +4,44 @@ All notable changes to Cookie Monster are documented here. The format is based o
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.7.9] — 2026-10-15
+
+### Fixed
+- **A second subscription went dark after every `claude` run** and the menu sat at
+  "reading this profile's usage…" forever. Each time Claude Code refreshes its token it
+  rewrites the keychain item, and a rewrite resets the item's partition list to the
+  writer's (`apple-tool:`), which silently drops any grant given to Cookie Monster —
+  confirmed on a live item: `["apple-tool:"]` right after a `claude` run.
+  - Cookie Monster now also reads through `/usr/bin/security`, the tool Claude Code
+    itself uses. Claude Code's own writes keep that tool allowed, so this survives every
+    refresh with no grant to lose.
+  - It is only started after the item's access list — read without decrypting anything,
+    the same view Keychain Access gives without a password — shows the tool is allowed
+    in both the decrypt entry and the partition list. Anything unclear means "don't".
+    A run still going after 3 s is killed and never repeated for that item.
+  - A refused item is retried only when it changes, and the card now says it can't be
+    read instead of "reading…".
+- **The app no longer runs `claude auth status` on every poll.** Claude Code answers it by
+  reading the keychain through `/usr/bin/security` with dialogs allowed, so a damaged item
+  or a locked keychain turned each poll into a dialog per profile — part of the earlier
+  storms (the log shows `timed out running claude` during them). Profile identity now
+  comes from the profile's own `.claude.json`; the interactive-shell PATH lookup that ran
+  your rc files is gone too.
+- Hardening from two rounds of adversarial review:
+  - The access-list check follows securityd's order (the first decrypt entry decides) and
+    fails closed; a locked keychain is "try later", never a refusal.
+  - A `security` run that hangs, fails, or overlaps a keychain dialog on screen blocks
+    that item for good, in a file shared by every copy of the app. Slowness alone (e.g.
+    right after wake) doesn't.
+  - One copy of the app at a time (enabling Start at Login used to start a second one).
+  - Reads are one at a time and never park a thread behind the explicit grant, whose
+    result is now kept even for a one-time "Allow".
+  - Switching subscriptions with the menu open updates the bars too, not just the list; an
+    unreadable or signed-out profile no longer leaves its last % in the menu bar.
+  - `build.sh` signs ad-hoc unless `SIGN_IDENTITY` is set, so a build never asks for a key.
+  - HTTP uses an ephemeral session (no on-disk cache of authorised requests); the log
+    file is written under a lock; `.claude.json` with a stray surrogate escape is read.
+
 ## [0.7.8] — 2026-10-15
 
 ### Fixed

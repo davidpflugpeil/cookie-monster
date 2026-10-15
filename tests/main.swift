@@ -185,5 +185,57 @@ check("account lookup skipped too", emailResult, "nil")
 check("~/.claude.json unchanged", sha(homeCfg), beforeCfg)
 check("~/.claude/settings.json unchanged", sha(homeSettings), beforeSettings)
 
+// MARK: keychain: when may /usr/bin/security read without a dialog?
+// Entries mirror a real Claude Code item's access list (Encrypt/Decrypt/Integrity/PartitionID/ChangeACL).
+do {
+    let dec = [kSecACLAuthorizationDecrypt as String, kSecACLAuthorizationDerive as String]
+    let enc = [kSecACLAuthorizationEncrypt as String]
+    let part = [kSecACLAuthorizationPartitionID as String]
+    let chg = [kSecACLAuthorizationChangeACL as String]
+    func item(decryptApps: [String]?, partitions: [String]?? = .some(["apple-tool:"]),
+              passphrase: Bool = false) -> [KeychainACLEntry] {
+        var e = [KeychainACLEntry(authorizations: enc, apps: nil),
+                 KeychainACLEntry(authorizations: dec, apps: decryptApps, requiresPassphrase: passphrase),
+                 KeychainACLEntry(authorizations: chg, apps: [])]
+        if case .some(let p) = partitions { e.append(KeychainACLEntry(authorizations: part, apps: nil, partitions: p)) }
+        return e
+    }
+    let cm = "/Applications/Cookie Monster.app", sec = "/usr/bin/security"
+    check("acl: repaired item → silent", "\(toolMaySilentlyDecrypt(item(decryptApps: [cm, sec], partitions: ["apple-tool:", "apple:", "teamid:29T68WB833"])))", "true")
+    check("acl: rewritten by Claude Code → silent", "\(toolMaySilentlyDecrypt(item(decryptApps: [cm, sec])))", "true")
+    check("acl: teamid-only partition (the storm) → refuse", "\(toolMaySilentlyDecrypt(item(decryptApps: [cm, sec], partitions: ["teamid:29T68WB833"])))", "false")
+    check("acl: tool not listed → refuse", "\(toolMaySilentlyDecrypt(item(decryptApps: [cm])))", "false")
+    check("acl: empty app list → refuse", "\(toolMaySilentlyDecrypt(item(decryptApps: [])))", "false")
+    check("acl: any app → silent", "\(toolMaySilentlyDecrypt(item(decryptApps: nil)))", "true")
+    check("acl: password required → refuse", "\(toolMaySilentlyDecrypt(item(decryptApps: [sec], passphrase: true)))", "false")
+    check("acl: unreadable partition entry → refuse", "\(toolMaySilentlyDecrypt(item(decryptApps: [sec], partitions: .some(nil))))", "false")
+    check("acl: no partition entry (legacy item) → silent", "\(toolMaySilentlyDecrypt(item(decryptApps: [sec], partitions: .none)))", "true")
+    check("acl: encrypt-only 'any' entry grants nothing", "\(toolMaySilentlyDecrypt([KeychainACLEntry(authorizations: enc, apps: nil)]))", "false")
+
+    let plist = try! PropertyListSerialization.data(fromPropertyList: ["Partitions": ["apple-tool:", "teamid:X"]], format: .xml, options: 0)
+    let hex = plist.map { String(format: "%02X", $0) }.joined()
+    check("partition ids from hex description", "\(partitionIDs(fromACLDescription: hex) ?? [])", "[\"apple-tool:\", \"teamid:X\"]")
+    check("partition ids from plain plist", "\(partitionIDs(fromACLDescription: String(decoding: plist, as: UTF8.self)) ?? [])", "[\"apple-tool:\", \"teamid:X\"]")
+    check("partition ids from garbage", "\(partitionIDs(fromACLDescription: "zz-not-a-plist") == nil)", "true")
+}
+
+// MARK: keychain round 2: ordered ACL evaluation, tolerant config
+do {
+    let dec = [kSecACLAuthorizationDecrypt as String]
+    let part = KeychainACLEntry(authorizations: [kSecACLAuthorizationPartitionID as String], apps: nil, partitions: ["apple-tool:"])
+    let sec = "/usr/bin/security"
+    let admits = KeychainACLEntry(authorizations: dec, apps: [sec])
+    check("acl order: earlier confirm entry wins → refuse", "\(toolMaySilentlyDecrypt([KeychainACLEntry(authorizations: dec, apps: ["/Applications/Other.app"]), admits, part]))", "false")
+    check("acl order: earlier passphrase entry wins → refuse", "\(toolMaySilentlyDecrypt([KeychainACLEntry(authorizations: dec, apps: [sec], requiresPassphrase: true), admits, part]))", "false")
+    check("acl order: earlier unreadable entry wins → refuse", "\(toolMaySilentlyDecrypt([KeychainACLEntry(authorizations: dec, apps: [], requiresPassphrase: true, partitions: nil), admits, part]))", "false")
+    check("acl order: admitting entry first → silent", "\(toolMaySilentlyDecrypt([admits, KeychainACLEntry(authorizations: dec, apps: []), part]))", "true")
+
+    let lone = #"{"history":"bad \ud83d here","oauthAccount":{"emailAddress":"a@b.c"},"pair":"\ud83d\ude00"}"#
+    let v = parseJSONTolerantly(lone.data(using: .utf8)!) as? [String: Any]
+    check("lone surrogate tolerated", "\(((v?["oauthAccount"] as? [String: Any])?["emailAddress"] as? String) ?? "nil")", "a@b.c")
+    check("valid surrogate pair kept", (v?["pair"] as? String) ?? "nil", "😀")
+    check("lone surrogate → U+FFFD", (v?["history"] as? String) ?? "nil", "bad \u{FFFD} here")
+}
+
 print(failures == 0 ? "\nALL PASS" : "\n\(failures) FAILED")
 exit(failures == 0 ? 0 : 1)
