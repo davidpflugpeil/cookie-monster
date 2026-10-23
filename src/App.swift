@@ -261,8 +261,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let dir = prof.configDir
         profileFetchedAt[dir] = Date()
         DispatchQueue.global(qos: .utility).async {
-            let service = prof.isDefault ? kKeychainService : recordedKeychainService(dir)
-            guard let service = service, let creds = usableCredentials(service: service) else {
+            let service = claudeServiceForProfile(prof)
+            guard let service = service,
+                  let creds = usableCredentials(service: service, envConfigDir: prof.envConfigDir,
+                                                configDir: prof.configDir) else {
                 DispatchQueue.main.async {
                     // Only fall back to the placeholder when there is genuinely nothing to
                     // show. Overwriting a cached reading left the card blank while the
@@ -333,7 +335,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard !denied.isEmpty else { return [] }
         var needed = [kKeychainService]
         for prof in listProfiles(.claude) where !prof.isDefault {
-            if let s = recordedKeychainService(prof.configDir) { needed.append(s) }
+            if let s = claudeServiceForProfile(prof) { needed.append(s) }
         }
         return needed.filter { denied.contains($0) }
     }
@@ -365,7 +367,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// One silent keychain search per profile per launch; see discoverKeychainService.
     private func attemptDiscovery(_ prof: Profile) {
         let dir = prof.configDir
-        guard !prof.isDefault, recordedKeychainService(dir) == nil else { return }
+        guard !prof.isDefault, claudeServiceForProfile(prof) == nil else { return }
         // Retry on an interval rather than once per launch: a single failed search used to
         // leave the profile dark until the app was restarted.
         if let last = discoveryAttemptedAt[dir], Date().timeIntervalSince(last) < kDiscoveryRetryInterval {
@@ -681,6 +683,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             disabled(menu, "Switching won't affect `claude`, and signing in will overwrite", bold: false)
             disabled(menu, "your default profile. Use Install Shell Setup.", bold: false)
         }
+        if !claudeTokensAwaitingStore().isEmpty {
+            menu.addItem(.separator())
+            disabled(menu, "⚠︎ A refreshed Claude sign-in isn't saved yet", bold: true)
+            disabled(menu, "Retrying every poll. If Claude Code later says you're signed out,", bold: false)
+            disabled(menu, "run `claude /login` once.", bold: false)
+        }
         if !neededDeniedServices().isEmpty {
             menu.addItem(.separator())
             disabled(menu, "⚠︎ Claude sign-in not readable", bold: true)
@@ -860,7 +868,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let dir = activeProfileDir(p)
         // A sign-in we may not read without asking would otherwise sit at "reading…" forever.
         if p == .claude, let prof = listProfiles(p).first(where: { $0.configDir == dir }),
-           let service = prof.isDefault ? kKeychainService : recordedKeychainService(dir),
+           let service = claudeServiceForProfile(prof),
            keychainDeniedServices().contains(service) {
             return "can't read this sign-in without asking — see below"
         }
@@ -1200,6 +1208,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         render()
     }
     @objc func quit() { NSApp.terminate(nil) }
+
+    /// A refresh between the server's answer and the keychain write holds the only copy of
+    /// the new tokens; quitting then would sign Claude Code out. No new refresh starts once
+    /// quitting begins; the running one finishes (bounded by its own timeouts) and anything
+    /// still waiting gets one more attempt to be stored.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard claudeRefreshInProgress() else { return .terminateNow }
+        log("quit: waiting for a token refresh to finish storing")
+        DispatchQueue.global(qos: .userInitiated).async {
+            finishClaudeRefreshesForQuit()
+            DispatchQueue.main.async { NSApp.reply(toApplicationShouldTerminate: true) }
+        }
+        return .terminateLater
+    }
 }
 
 // MARK: - Info card (custom-drawn dropdown section: plan, email, usage bars, updated)

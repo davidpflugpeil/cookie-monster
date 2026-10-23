@@ -1,6 +1,7 @@
 // Core.swift — shared logic for the Cookie Monster 🍪 menu-bar app.
 // Foundation-only (no AppKit) so it stays easy to test and reuse.
 
+import CryptoKit
 import Foundation
 import Security
 
@@ -25,7 +26,7 @@ let kDiscoveryRetryInterval: TimeInterval = 600
 let kSignedOutBackoff: TimeInterval = 3600
 let kLogDir = (cmHome() as NSString).appendingPathComponent(".cookie-monster")
 let kLogFile = (kLogDir as NSString).appendingPathComponent("cookie-monster.log")
-let kVersion = "0.7.9"
+let kVersion = "0.8.0"
 
 // MARK: - Logging (no secrets ever pass through here)
 
@@ -232,14 +233,14 @@ private let kSecurityTool = "/usr/bin/security"
 
 enum SecretRead { case value(String), refused, unavailable }
 
-func keychainBlob(service: String = kKeychainService) -> SecretRead {
+func keychainBlob(service: String = kKeychainService, blockOnTimeout: Bool = true) -> SecretRead {
     let (status, data) = rawKeychainRead(service: service, allowUI: false)
     if status == errSecSuccess, let data = data {
         let blob = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
         return blob.map { $0.isEmpty ? .unavailable : .value($0) } ?? .unavailable
     }
     guard status == errSecInteractionNotAllowed || status == errSecAuthFailed else { return .unavailable }
-    switch securityToolRead(service: service) {
+    switch securityToolRead(service: service, blockOnTimeout: blockOnTimeout) {
     case .value(let blob): return .value(blob)
     case .refused: return .refused
     case .transient: return .unavailable     // e.g. keychain locked: try again next poll
@@ -379,7 +380,7 @@ enum ToolRead { case value(String), refused, transient }
 /// Route 2 of keychainBlob. Only a clean run — exit 0 with output, well under a second —
 /// counts as silent. Anything else from a run that did start means a dialog may have been
 /// involved, so the item is blocked for good. `keychain` is for tests only.
-func securityToolRead(service: String, keychain: String? = nil) -> ToolRead {
+func securityToolRead(service: String, keychain: String? = nil, blockOnTimeout: Bool = true) -> ToolRead {
     guard !toolBlockedOnDisk().contains(service) else { return .refused }
     let kcRef: SecKeychain? = keychain.flatMap { path in
         var k: SecKeychain?
@@ -395,7 +396,12 @@ func securityToolRead(service: String, keychain: String? = nil) -> ToolRead {
     if let keychain = keychain { args.append(keychain) }
     let run = runBoundedResult(kSecurityTool, args, env: [:], timeout: 3, watchForDialog: true)
     if run.launchFailed { return .transient }                   // nothing could have shown
-    if run.timedOut { blockTool(service, "didn't answer within 3 s"); return .refused }
+    if run.timedOut {
+        // Once new tokens are waiting to be stored, only a dialog actually seen is evidence;
+        // slowness right after wake is not, and blocking would strand those tokens.
+        guard blockOnTimeout || run.dialogSeen else { return .transient }
+        blockTool(service, "didn't answer within 3 s"); return .refused
+    }
     // Hard evidence only: a keychain dialog was on screen while it ran. Slowness alone
     // (e.g. just after wake) is not evidence, and blocking on it would cost the item.
     if run.dialogSeen { blockTool(service, "ran while a keychain dialog was up") }
@@ -682,8 +688,10 @@ func listProfiles(_ provider: Provider) -> [Profile] {
                        name: profileDisplayName(provider.defaultConfigDir, fallback: "Default"),
                        configDir: provider.defaultConfigDir)]
     let root = provider.profilesDir
+    // "<profile>.lock" is Claude Code's legacy refresh lock for that profile — a directory
+    // that sits right here while any refresh runs. It is not a profile.
     for name in ((try? FileManager.default.contentsOfDirectory(atPath: root)) ?? []).sorted()
-    where !name.hasPrefix(".") {
+    where !name.hasPrefix(".") && !name.hasSuffix(".lock") {
         let dir = (root as NSString).appendingPathComponent(name)
         var isDir: ObjCBool = false
         guard FileManager.default.fileExists(atPath: dir, isDirectory: &isDir), isDir.boolValue else { continue }
@@ -895,12 +903,13 @@ func runBoundedResult(_ executable: String, _ args: [String], env: [String: Stri
     // A silent read finishes in milliseconds; while one is still going, look for a dialog.
     var dialogSeen = false
     var finished = false
-    let deadline = Date().addingTimeInterval(timeout)
+    // Monotonic: the Mac sleeping mid-run must not count against the deadline.
+    let deadline = DispatchTime.now() + timeout
     while !finished {
         let slice = watchForDialog ? 0.2 : timeout
         if done.wait(timeout: .now() + slice) == .success { finished = true; break }
         if watchForDialog, keychainDialogShowing() { dialogSeen = true }
-        if Date() >= deadline { break }
+        if DispatchTime.now() >= deadline { break }
     }
     if !finished {
         kill(p.processIdentifier, SIGKILL)
@@ -924,7 +933,7 @@ func claudeProfileIdentity(_ prof: Profile) -> AuthStatus? {
     let cfg = prof.isDefault ? kClaudeConfigPath
                              : (prof.configDir as NSString).appendingPathComponent(".claude.json")
     let email = readClaudeAccount(path: cfg)?.email
-    let service = prof.isDefault ? kKeychainService : recordedKeychainService(prof.configDir)
+    let service = claudeServiceForProfile(prof)
     let hasEntry = service.map { keychainModDate(service: $0) != nil } ?? false
     // An unreadable config with no known entry is "don't know", not "signed out".
     if email == nil, !hasEntry, FileManager.default.fileExists(atPath: cfg),
@@ -986,24 +995,467 @@ func shellSnippetInstalled() -> Bool {
     return false
 }
 
-// MARK: - No keychain writes, ever
+// MARK: - Keeping Claude tokens fresh — exactly the way Claude Code does it
 
-// 0.7.0 refreshed expired tokens and wrote them back to Claude Code's keychain item. Two apps
-// writing one item is what caused the prompt storms: on macOS the last writer can lock the
-// other out, so each Claude Code refresh made Cookie Monster prompt and each Cookie Monster
-// refresh made Claude Code prompt. This app now never writes to the keychain. Claude Code
-// refreshes its own token whenever it runs; an expired token here is shown as such, and the
-// usage call short-circuits so no request is made with it.
+// Claude Code refreshes its token only when it runs, so an unused subscription expired
+// within hours. 0.7.0–0.7.7 refreshed it for you but wrote the result IN-PROCESS
+// (SecItemUpdate); on macOS a write resets the item's partition list to the writer's, which
+// locked Claude Code's own reader (/usr/bin/security) out — the prompt storms. 0.7.8 stopped
+// writing, and tokens went stale again.
+//
+// This follows Claude Code's refresh protocol as read out of its binary (2.1.306):
+//   - the same lock directories, so it never refreshes alongside a running `claude`;
+//   - re-read under the lock: if someone already refreshed, use theirs;
+//   - the same request (TOKEN_URL, JSON body incl. scope) and the same response mapping;
+//   - compare-and-swap before writing — only if the stored refresh token is still the one
+//     we sent — retried up to 3 times, changing only the claudeAiOauth token fields;
+//   - the same write: `security add-generic-password -U -a $USER -s <item> -X <hex>`, so
+//     afterwards the item's access is exactly as after Claude Code's own refresh.
+// Once the server has answered 200 it may have retired the old refresh token, so every
+// go/no-go check happens BEFORE the request; after it, the new tokens are only ever stored,
+// retried, or kept in memory to store on the next poll — never silently dropped.
 
-/// Returns the stored credentials as-is. Read-only by design — see "No keychain writes".
-func usableCredentials(service: String) -> Credentials? {
-    readCredentials(service: service)
+/// Claude Code's TOKEN_URL, and a second Anthropic token endpoint that is used only when
+/// the first provably did not process the request (429/403/404/405).
+let kOAuthTokenURLs = [URL(string: "https://platform.claude.com/v1/oauth/token")!,
+                       URL(string: "https://api.anthropic.com/v1/oauth/token")!]
+/// Claude Code's own OAuth client id, read out of the installed binary.
+let kOAuthClientID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+/// Claude Code refreshes when `now + 5 min >= expiresAt`.
+let kRefreshLead: TimeInterval = 300
+
+/// Claude Code's keychain service for a config dir: "Claude Code-credentials" when
+/// CLAUDE_CONFIG_DIR is unset, otherwise suffixed with the first 8 hex digits of
+/// SHA-256(dir, NFC). Confirmed against this Mac's entries.
+func claudeKeychainService(envConfigDir: String?) -> String {
+    guard let dir = envConfigDir else { return kKeychainService }
+    let digest = SHA256.hash(data: Data(dir.precomposedStringWithCanonicalMapping.utf8))
+    return kKeychainService + "-" + digest.map { String(format: "%02x", $0) }.joined().prefix(8)
+}
+
+/// The entry `claude` uses for a profile: the derived name when that item exists, else
+/// whatever discovery recorded (an entry from before a move, say).
+func claudeServiceForProfile(_ prof: Profile) -> String? {
+    if prof.isDefault { return kKeychainService }
+    let derived = claudeKeychainService(envConfigDir: prof.configDir)
+    if keychainModDate(service: derived) != nil { return derived }
+    return recordedKeychainService(prof.configDir)
+}
+
+/// Claude Code's keychain account: $USER, or "claude-code-user" if that isn't a plain name.
+func claudeKeychainAccount(user: String? = ProcessInfo.processInfo.environment["USER"]) -> String {
+    let u = (user?.isEmpty == false ? user! : NSUserName())
+    return u.range(of: "^[a-zA-Z0-9._-]+$", options: .regularExpression) != nil ? u : "claude-code-user"
+}
+
+func needsRefresh(_ expiresAt: Date?, now: Date = Date()) -> Bool {
+    guard let e = expiresAt else { return false }
+    return now.addingTimeInterval(kRefreshLead) >= e
+}
+
+/// Claude Code's refresh locks for a config dir (proper-lockfile: a directory created with
+/// mkdir whose mtime the holder sets every 5 s; stale after 60 s). It takes the new one,
+/// then the legacy one; so do we. Like proper-lockfile we remember the mtime we set, and
+/// treat the lock as no longer ours once it differs — then we never touch or remove it.
+final class ClaudeRefreshLock {
+    let paths: [String]
+    private var stamps: [String: Int] = [:]     // path → mtime (whole seconds) we last set
+    private let beat = NSLock()
+    private var beating = false
+
+    init(configDir: String) {
+        paths = [(configDir as NSString).appendingPathComponent(".oauth_refresh.lock"),
+                 (configDir as NSString).resolvingSymlinksInPath + ".lock"]
+    }
+
+    private static func mtime(_ p: String) -> Int? {
+        var st = stat()
+        return stat(p, &st) == 0 ? Int(st.st_mtimespec.tv_sec) : nil
+    }
+    private func stamp(_ p: String) {
+        let t = Int(Date().timeIntervalSince1970)
+        var tv = [timeval(tv_sec: t, tv_usec: 0), timeval(tv_sec: t, tv_usec: 0)]
+        if utimes(p, &tv) == 0 { stamps[p] = t }
+    }
+    private func ours(_ p: String) -> Bool { stamps[p] != nil && ClaudeRefreshLock.mtime(p) == stamps[p] }
+
+    /// False if `claude` (or another copy of us) holds either lock — it is refreshing, and the
+    /// next poll will read its result. A lock untouched for 10 minutes is a crashed holder's.
+    func acquire(now: Date = Date()) -> Bool {
+        beat.lock(); defer { beat.unlock() }
+        for p in paths {
+            var got = mkdir(p, 0o755) == 0
+            if !got, errno == EEXIST, let m = ClaudeRefreshLock.mtime(p),
+               Int(now.timeIntervalSince1970) - m > 600, rmdir(p) == 0 {
+                got = mkdir(p, 0o755) == 0
+            }
+            guard got else { releaseLocked(); return false }
+            stamp(p)
+        }
+        beating = true
+        Thread { [weak self] in
+            while true {
+                Thread.sleep(forTimeInterval: 5)
+                guard let self = self else { return }
+                self.beat.lock()
+                defer { self.beat.unlock() }
+                guard self.beating else { return }
+                for p in self.paths where self.ours(p) { self.stamp(p) }
+            }
+        }.start()
+        return true
+    }
+
+    /// Both locks still carry the mtime we set: nobody has taken them over.
+    func stillOurs() -> Bool {
+        beat.lock(); defer { beat.unlock() }
+        return beating && paths.allSatisfy { ours($0) }
+    }
+
+    func release() {
+        beat.lock(); defer { beat.unlock() }
+        releaseLocked()
+    }
+    private func releaseLocked() {
+        beating = false
+        for p in paths.reversed() where ours(p) { rmdir(p) }
+        stamps = [:]
+    }
+}
+
+/// The stored token fields after a successful refresh, merged the way Claude Code merges
+/// them: only these keys change; every other key in the blob is kept as it was.
+func mergeRefreshedTokens(into root: [String: Any], response r: [String: Any],
+                          postedRefreshToken: String, now: Date = Date()) -> [String: Any]? {
+    guard var oauth = root["claudeAiOauth"] as? [String: Any],
+          let access = r["access_token"] as? String, !access.isEmpty,
+          let expiresIn = (r["expires_in"] as? NSNumber)?.doubleValue else { return nil }
+    func ms(_ d: Date) -> NSNumber { NSNumber(value: Int64((d.timeIntervalSince1970 * 1000).rounded())) }
+    oauth["accessToken"] = access
+    // Claude Code: `refresh_token: K = e` — keep the posted one if none is returned.
+    oauth["refreshToken"] = (r["refresh_token"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? postedRefreshToken
+    oauth["expiresAt"] = ms(now.addingTimeInterval(expiresIn))
+    if let rt = (r["refresh_token_expires_in"] as? NSNumber)?.doubleValue {
+        oauth["refreshTokenExpiresAt"] = ms(now.addingTimeInterval(rt))
+    }
+    if let scope = r["scope"] as? String {
+        let scopes = scope.split(separator: " ").map(String.init)
+        if !scopes.isEmpty { oauth["scopes"] = scopes }
+    }
+    var out = root
+    out["claudeAiOauth"] = oauth
+    return out
+}
+
+/// Claude Code's write, argument for argument. The blobs here (tens of KB: they carry the
+/// MCP servers' tokens too) exceed what `security -i` accepts on stdin, which is why Claude
+/// Code itself passes them this way for these sizes.
+func securityWriteArguments(service: String, account: String, json: Data) -> [String] {
+    ["add-generic-password", "-U", "-a", account, "-s", service,
+     "-X", json.map { String(format: "%02x", $0) }.joined()]
+}
+
+/// Back-off after a failed refresh that wasn't a rejection: 5 min doubling to 2 h.
+func refreshBackoff(failures: Int) -> TimeInterval {
+    min(300 * pow(2, Double(max(failures - 1, 0))), 7200)
+}
+
+// Per-item refresh bookkeeping. No secrets, so it is kept on disk: a relaunch must not
+// re-send a refresh token the server already rejected.
+private struct RefreshMemo: Codable {
+    var notBefore: Date?
+    var rejectedAtMod: Date?       // item modification date whose refresh token was refused
+    var failures = 0
+}
+private let refreshStateLock = NSLock()
+private func refreshMemoPath() -> String {
+    (cmHome() as NSString).appendingPathComponent(".cookie-monster/refresh-state.json")
+}
+private var refreshMemo: [String: RefreshMemo] = {
+    guard let d = FileManager.default.contents(atPath: refreshMemoPath()) else { return [:] }
+    return (try? JSONDecoder().decode([String: RefreshMemo].self, from: d)) ?? [:]
+}()
+private func updateMemo(_ service: String, _ change: (inout RefreshMemo) -> Void) {
+    refreshStateLock.lock(); defer { refreshStateLock.unlock() }
+    var m = refreshMemo[service] ?? RefreshMemo()
+    change(&m)
+    refreshMemo[service] = m
+    try? FileManager.default.createDirectory(atPath: (refreshMemoPath() as NSString).deletingLastPathComponent,
+                                             withIntermediateDirectories: true)
+    if let d = try? JSONEncoder().encode(refreshMemo) { try? d.write(to: URL(fileURLWithPath: refreshMemoPath())) }
+}
+
+/// Tokens the server issued that couldn't be stored yet (keychain locked, say). In memory
+/// only — they are secrets — and stored on the next poll under the same compare-and-swap.
+private var pendingTokens: [String: (posted: String, answer: [String: Any], issuedAt: Date, configDir: String)] = [:]
+private let refreshLock = NSLock()                     // one refresh at a time, app-wide
+private var refreshesInFlight = 0
+private var shuttingDown = false
+
+/// For quitting: true while a refresh is running or issued tokens still wait to be stored.
+func claudeRefreshInProgress() -> Bool {
+    refreshStateLock.lock(); defer { refreshStateLock.unlock() }
+    return refreshesInFlight > 0 || !pendingTokens.isEmpty
+}
+
+/// Services whose refreshed tokens exist only in memory right now (for the menu).
+func claudeTokensAwaitingStore() -> [String] {
+    refreshStateLock.lock(); defer { refreshStateLock.unlock() }
+    return pendingTokens.keys.sorted()
+}
+
+/// Quitting: no new refresh may start, and tokens already issued get one more chance to be
+/// stored. Returns when nothing is in flight (or after `timeout`).
+func finishClaudeRefreshesForQuit(timeout: TimeInterval = 150) {
+    refreshStateLock.lock(); shuttingDown = true; refreshStateLock.unlock()
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+        refreshStateLock.lock(); let busy = refreshesInFlight; let pending = pendingTokens; refreshStateLock.unlock()
+        if busy == 0 {
+            for (service, p) in pending { _ = storePendingTokens(service: service, configDir: p.configDir) }
+            refreshStateLock.lock(); let left = pendingTokens.keys.sorted(); refreshStateLock.unlock()
+            if !left.isEmpty {
+                log("quit: refreshed tokens for \(left.joined(separator: ", ")) could not be stored — "
+                    + "if Claude Code says you're signed out, run claude /login")
+            }
+            return
+        }
+        Thread.sleep(forTimeInterval: 0.2)
+    }
+    log("quit: gave up waiting for a token refresh after \(Int(timeout)) s")
+}
+
+/// Stores tokens issued earlier (never re-requests them), under Claude Code's locks.
+@discardableResult
+private func storePendingTokens(service: String, configDir: String) -> Bool {
+    refreshLock.lock(); defer { refreshLock.unlock() }
+    refreshStateLock.lock(); let p = pendingTokens[service]; refreshStateLock.unlock()
+    guard let p = p else { return true }
+    let lock = ClaudeRefreshLock(configDir: configDir)
+    guard lock.acquire() else { return false }
+    defer { lock.release() }
+    let outcome = persistRefreshed(service: service, account: claudeKeychainAccount(), posted: p.posted,
+                                   answer: p.answer, issuedAt: p.issuedAt, fallback: nil, lock: lock)
+    guard outcome != .deferred else { return false }
+    refreshStateLock.lock(); pendingTokens[service] = nil; refreshStateLock.unlock()
+    invalidateCredentials(service: service)
+    return true
+}
+
+private func rawBlob(_ service: String, afterRefresh: Bool = false) -> [String: Any]? {
+    // Bounded: we may be holding Claude Code's locks, and a grant dialog can hold this one.
+    guard secretReadLock.lock(before: Date().addingTimeInterval(5)) else { return nil }
+    defer { secretReadLock.unlock() }
+    guard case .value(let blob) = keychainBlob(service: service, blockOnTimeout: !afterRefresh) else { return nil }
+    return parseJSONTolerantly(Data(blob.utf8)) as? [String: Any]
+}
+
+/// Returns credentials that are good to use, refreshing them first — as Claude Code would —
+/// when they are within 5 minutes of expiry. Any doubt means "don't touch it": the stale
+/// credentials come back unchanged and the usage call reports the token as expired.
+func usableCredentials(service: String, envConfigDir: String?, configDir: String) -> Credentials? {
+    guard let creds = readCredentials(service: service) else { return nil }
+    refreshStateLock.lock(); let pending = pendingTokens[service] != nil; refreshStateLock.unlock()
+    guard needsRefresh(creds.expiresAt) || pending else { return creds }
+    // Only an entry provably tied to this config dir: that dir's locks are what keep us
+    // from racing the `claude` that owns it.
+    guard service == claudeKeychainService(envConfigDir: envConfigDir) else {
+        log("refresh: \(service) isn't the entry Claude Code derives for this profile — not refreshing it")
+        return creds
+    }
+    let mod = keychainModDate(service: service)
+    refreshStateLock.lock()
+    let memo = refreshMemo[service] ?? RefreshMemo()
+    refreshStateLock.unlock()
+    if !pending {
+        if let nb = memo.notBefore, Date() < nb { return creds }
+        if let r = memo.rejectedAtMod, r == mod { return creds }    // dead until you sign in again
+    }
+    updateMemo(service) { $0.notBefore = Date().addingTimeInterval(refreshBackoff(failures: max(memo.failures, 1))) }
+    return refreshClaudeToken(service: service, configDir: configDir) ?? creds
+}
+
+private enum Persist { case stored, superseded, deferred }
+
+private func refreshClaudeToken(service: String, configDir: String) -> Credentials? {
+    let account = claudeKeychainAccount()
+    // Go/no-go, all of it before anything is sent.
+    guard !toolBlockedOnDisk().contains(service), securityToolVerdict(service: service) == .silent,
+          let (_, itemAccount) = keychainItemRef(service: service, keychain: nil) else { return nil }
+    guard itemAccount == account else {
+        log("refresh: \(service) belongs to account \(itemAccount), not \(account) — not touching it")
+        return nil
+    }
+    refreshStateLock.lock(); let quitting = shuttingDown; refreshStateLock.unlock()
+    if quitting { return nil }
+    refreshLock.lock(); defer { refreshLock.unlock() }
+    refreshStateLock.lock()
+    if shuttingDown { refreshStateLock.unlock(); return nil }
+    refreshesInFlight += 1
+    refreshStateLock.unlock()
+    defer { refreshStateLock.lock(); refreshesInFlight -= 1; refreshStateLock.unlock() }
+    let lock = ClaudeRefreshLock(configDir: configDir)
+    guard lock.acquire() else { log("refresh: \(service) is being refreshed by claude — leaving it"); return nil }
+    defer { lock.release() }
+
+    // Tokens issued earlier that couldn't be stored: store those first, never re-request.
+    refreshStateLock.lock(); let pending = pendingTokens[service]; refreshStateLock.unlock()
+    if let p = pending {
+        let outcome = persistRefreshed(service: service, account: account, posted: p.posted,
+                                       answer: p.answer, issuedAt: p.issuedAt, fallback: nil, lock: lock)
+        if outcome == .deferred { return nil }
+        refreshStateLock.lock(); pendingTokens[service] = nil; refreshStateLock.unlock()
+        invalidateCredentials(service: service)
+        return readCredentials(service: service)
+    }
+
+    // Under the lock, from the keychain itself — not our cache.
+    invalidateCredentials(service: service)
+    guard let before = rawBlob(service), let oauth = before["claudeAiOauth"] as? [String: Any],
+          let posted = oauth["refreshToken"] as? String, !posted.isEmpty else { return nil }
+    let storedExpiry = (oauth["expiresAt"] as? NSNumber).map { Date(timeIntervalSince1970: $0.doubleValue / 1000) }
+    guard needsRefresh(storedExpiry) else {                 // someone refreshed in the meantime
+        updateMemo(service) { $0 = RefreshMemo() }
+        return readCredentials(service: service)
+    }
+    let scopes = (oauth["scopes"] as? [String]) ?? []
+    // Last checks: after a 200 nothing may abort.
+    refreshStateLock.lock(); let stopping = shuttingDown; refreshStateLock.unlock()
+    guard !stopping, lock.stillOurs(), !toolBlockedOnDisk().contains(service),
+          securityToolVerdict(service: service) == .silent else { return nil }
+
+    let issuedAt = Date()
+    let (status, answer, retryAfter) = postRefresh(refreshToken: posted, scopes: scopes)
+    guard status == 200 else {
+        let mod = keychainModDate(service: service)
+        updateMemo(service) { m in
+            m.failures += 1
+            if status == 400 || status == 401 { m.rejectedAtMod = mod }
+            else if status == 429 { m.notBefore = Date().addingTimeInterval(retryAfter ?? 3600) }
+            else { m.notBefore = Date().addingTimeInterval(refreshBackoff(failures: m.failures)) }
+        }
+        log("refresh: \(service) failed (HTTP \(status)) — nothing was written")
+        return nil
+    }
+    guard let answer = answer, mergeRefreshedTokens(into: before, response: answer, postedRefreshToken: posted) != nil else {
+        // 200 but no usable tokens: the old refresh token may be gone. Loud, and parked.
+        updateMemo(service) { $0.failures += 1; $0.notBefore = Date().addingTimeInterval(7200) }
+        log("refresh: \(service) — HTTP 200 without usable tokens; if Claude Code says you're signed out, run claude /login")
+        return nil
+    }
+
+    switch persistRefreshed(service: service, account: account, posted: posted, answer: answer,
+                            issuedAt: issuedAt, fallback: before, lock: lock) {
+    case .stored, .superseded:
+        updateMemo(service) { $0 = RefreshMemo() }
+        invalidateCredentials(service: service)
+        return readCredentials(service: service)
+    case .deferred:
+        refreshStateLock.lock()
+        pendingTokens[service] = (posted, answer, issuedAt, configDir)
+        refreshStateLock.unlock()
+        log("refresh: \(service) — new tokens kept in memory; storing them on the next poll")
+        return nil
+    }
+}
+
+/// Stores refreshed tokens under the compare-and-swap, up to 3 attempts like Claude Code.
+/// `fallback` is the blob read under the lock, used if the re-read itself fails.
+private func persistRefreshed(service: String, account: String, posted: String, answer: [String: Any],
+                              issuedAt: Date, fallback: [String: Any]?, lock: ClaudeRefreshLock) -> Persist {
+    for attempt in 0..<3 {
+        if attempt > 0 { Thread.sleep(forTimeInterval: 0.5 * Double(attempt)) }
+        if !lock.stillOurs() { log("refresh: \(service) — lock was taken over; relying on compare-and-swap") }
+        let current = rawBlob(service, afterRefresh: true)
+        if let cur = current, let stored = (cur["claudeAiOauth"] as? [String: Any])?["refreshToken"] as? String,
+           !stored.isEmpty, stored != posted {
+            log("refresh: \(service) — a newer token was stored meanwhile; keeping it")
+            return .superseded
+        }
+        guard let base = current ?? fallback,
+              let merged = mergeRefreshedTokens(into: base, response: answer, postedRefreshToken: posted, now: issuedAt),
+              // Like JSON.stringify: no "\/" escapes (MCP server URLs are full of slashes).
+              let json = try? JSONSerialization.data(withJSONObject: merged, options: [.withoutEscapingSlashes]),
+              let newAccess = (merged["claudeAiOauth"] as? [String: Any])?["accessToken"] as? String else { continue }
+        // Never start the tool where it might show a dialog — keep the tokens for later.
+        guard !toolBlockedOnDisk().contains(service), securityToolVerdict(service: service) == .silent else {
+            return .deferred
+        }
+        guard secretReadLock.lock(before: Date().addingTimeInterval(5)) else { continue }
+        let run = runBoundedResult(kSecurityTool, securityWriteArguments(service: service, account: account, json: json),
+                                   env: [:], timeout: 10, watchForDialog: true)
+        secretReadLock.unlock()
+        // Only a dialog actually seen blocks the tool; a slow write (just after wake, say)
+        // is retried — blocking here would strand tokens the server already issued.
+        if run.dialogSeen && run.elapsed >= 0.5 { blockTool(service, "write ran while a keychain dialog was up") }
+        if run.timedOut { log("refresh: writing \(service) timed out (attempt \(attempt + 1))"); continue }
+        if run.status == 36 { return .deferred }                          // keychain locked
+        guard run.status == 0 else {
+            log("refresh: writing \(service) failed (exit \(run.status), attempt \(attempt + 1))"); continue
+        }
+        if let after = rawBlob(service, afterRefresh: true),
+           (after["claudeAiOauth"] as? [String: Any])?["accessToken"] as? String == newAccess {
+            log("refresh: \(service) refreshed and stored for Claude Code")
+            return .stored
+        }
+        log("refresh: \(service) didn't read back as written (attempt \(attempt + 1))")
+    }
+    return .deferred
+}
+
+/// Claude Code's request: JSON {grant_type, refresh_token, client_id, scope}. Falls back to
+/// the second endpoint only when the first provably didn't process the request, and retries
+/// once without `scope` on invalid_scope (as Claude Code does).
+private func postRefresh(refreshToken: String, scopes: [String]) -> (Int, [String: Any]?, TimeInterval?) {
+    var withScope = !scopes.isEmpty
+    var last: (Int, [String: Any]?, TimeInterval?) = (-1, nil, nil)
+    for url in kOAuthTokenURLs {
+        while true {
+            var fields: [String: Any] = ["grant_type": "refresh_token", "refresh_token": refreshToken,
+                                         "client_id": kOAuthClientID]
+            if withScope { fields["scope"] = scopes.joined(separator: " ") }
+            last = postJSON(url, fields)
+            if last.0 == 400, withScope, (last.1?["error"] as? String) == "invalid_scope" { withScope = false; continue }
+            break
+        }
+        guard [403, 404, 405, 429].contains(last.0) else { return last }
+    }
+    return last
+}
+
+/// The request's total deadline belongs to the session, and we wait for its completion — a
+/// slow 200 must not arrive after we've given up on it.
+private let kTokenSession: URLSession = {
+    let c = URLSessionConfiguration.ephemeral
+    c.timeoutIntervalForRequest = 20
+    c.timeoutIntervalForResource = 30
+    return URLSession(configuration: c)
+}()
+
+private func postJSON(_ url: URL, _ fields: [String: Any]) -> (Int, [String: Any]?, TimeInterval?) {
+    var req = URLRequest(url: url)
+    req.httpMethod = "POST"
+    req.setValue("claude-code/\(claudeCodeVersion())", forHTTPHeaderField: "User-Agent")
+    req.setValue("application/json", forHTTPHeaderField: "Accept")
+    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    req.httpBody = try? JSONSerialization.data(withJSONObject: fields)
+    let sem = DispatchSemaphore(value: 0)
+    var result: (Int, [String: Any]?, TimeInterval?) = (-1, nil, nil)
+    let task = kTokenSession.dataTask(with: req) { d, resp, _ in
+        let http = resp as? HTTPURLResponse
+        let retry = (http?.value(forHTTPHeaderField: "Retry-After")).flatMap(TimeInterval.init)
+        result = (http?.statusCode ?? -1, d.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }, retry)
+        sem.signal()
+    }
+    task.resume()
+    if sem.wait(timeout: .now() + 40) == .timedOut { task.cancel(); _ = sem.wait(timeout: .now() + 5) }
+    return result
 }
 
 // MARK: - Finding a profile's keychain entry
 
-/// Claude Code derives a per-config-dir keychain service name by an undocumented scheme we
-/// could not reproduce. We can still *find* it: enumerating generic-password ATTRIBUTES is
+/// Claude Code's per-config-dir service is claudeKeychainService(envConfigDir:); this
+/// search is the fallback for an entry that name doesn't match (e.g. a moved profile). enumerating generic-password ATTRIBUTES is
 /// free and silent (no kSecReturnData, so nothing is decrypted and macOS never prompts).
 /// The entry belonging to a profile is the one created when that profile was signed in.
 func claudeCredentialServices() -> [(service: String, created: Date)] {

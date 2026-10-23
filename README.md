@@ -98,16 +98,20 @@ display.
 Both are polled every 60 seconds (configurable). The pinned window's percentage
 goes in the bar, color-coded green < 50%, orange < 80%, red ≥ 80%.
 
-**Credentials:** read-only. The app reads your existing tokens in-process with
-keychain UI disabled, so a read it isn't allowed to make fails silently instead of
-prompting. When the app itself isn't allowed — Claude Code's token refreshes reset the
-item's access — it reads through `/usr/bin/security`, the tool Claude Code itself uses,
-but only after the item's access list (checked without decrypting anything) shows that
-read can't show a dialog. It never writes to the keychain and never writes
-`~/.codex/auth.json`.
-(0.7.0–0.7.7 refreshed tokens and wrote them back; that rewrite locked Claude Code
-out of its own item and caused prompt storms — see the 0.7.8 changelog entry.)
-A token or raw API response is never logged. A small diagnostic log (status codes + percentages
+**Credentials:** read with keychain UI disabled, so a read it isn't allowed to make fails
+silently instead of prompting; when the app itself isn't allowed, it reads through
+`/usr/bin/security`, the tool Claude Code uses, after checking the item's access list
+(without decrypting anything) shows that read can't show a dialog.
+
+**Token refresh:** Claude Code only refreshes its sign-in when you run it, so an unused
+subscription expires within hours. Cookie Monster refreshes it the way Claude Code does —
+taking Claude Code's own refresh lock (`<config dir>/.oauth_refresh.lock`), re-reading the
+item under it, writing only if nobody refreshed in the meantime, changing only the token
+fields — and stores it with Claude Code's own command
+(`security add-generic-password -U -a <user> -s <item> -X <hex>`), so the item looks
+exactly as after Claude Code's own refresh. It never writes from inside the app (that
+reset the item's access in 0.7.x and caused prompt storms). `~/.codex/auth.json` is never
+written. A token or raw API response is never logged. A small diagnostic log (status codes + percentages
 only) is kept at `~/.cookie-monster/cookie-monster.log`.
 
 ## Settings
@@ -148,10 +152,10 @@ copied settings — check it before removing the directory, and delete the
   hour if you poll too often. Cookie Monster honours it, keeps showing the last
   good reading with a `rate limited · <countdown>` note, and retries once the
   window clears — so there is nothing to do but wait.
-- **Token refresh:** if a section shows *not signed in*, that provider's OAuth
-  token expired — run `claude` or `codex` once to refresh it, then click
-  **Refresh Now**. Cookie Monster does not refresh tokens itself: refresh tokens
-  rotate, so doing it would mean writing to Claude Code's keychain item.
+- **Token refresh:** Claude tokens are refreshed automatically (see *How it works*).
+  If a section still shows *token expired* or *not signed in*, the refresh token
+  itself is gone (they last weeks) — sign in again with `claude`. Codex tokens are
+  not refreshed by the app; run `codex` once if its section says so.
 - Both usage endpoints are **undocumented** and may change without notice. If the
   numbers stop appearing, check the field names in [`src/Core.swift`](src/Core.swift)
   (`five_hour` / `seven_day` / `seven_day_opus` / `seven_day_sonnet` for Claude,

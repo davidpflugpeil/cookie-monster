@@ -237,5 +237,78 @@ do {
     check("lone surrogate → U+FFFD", (v?["history"] as? String) ?? "nil", "bad \u{FFFD} here")
 }
 
+// MARK: token refresh, Claude Code-compatible
+do {
+    check("service for default (CLAUDE_CONFIG_DIR unset)", claudeKeychainService(envConfigDir: nil), "Claude Code-credentials")
+    check("service = sha256(dir) prefix, as Claude Code derives it",
+          claudeKeychainService(envConfigDir: "/Users/davidpflugpeil/.cookie-monster/profiles/claude/David"),
+          "Claude Code-credentials-43cd72e0")
+    let now = Date(timeIntervalSince1970: 1_800_000_000)
+    check("no refresh with 6 min left", "\(needsRefresh(now.addingTimeInterval(360), now: now))", "false")
+    check("refresh with 4 min left (Claude Code: 5 min)", "\(needsRefresh(now.addingTimeInterval(240), now: now))", "true")
+    check("refresh when expired", "\(needsRefresh(now.addingTimeInterval(-36000), now: now))", "true")
+
+    let root: [String: Any] = [
+        "claudeAiOauth": ["accessToken": "old-a", "refreshToken": "old-r", "expiresAt": 1, "scopes": ["a"],
+                          "subscriptionType": "max", "rateLimitTier": "tier", "refreshTokenExpiresAt": 2],
+        "mcpOAuth": ["server|x": ["accessToken": "mcp-secret"]],
+    ]
+    let m = mergeRefreshedTokens(into: root, response: ["access_token": "new-a", "expires_in": 28800,
+                                                        "refresh_token_expires_in": 100, "scope": "a b"],
+                                 postedRefreshToken: "old-r", now: now)
+    let o = m?["claudeAiOauth"] as? [String: Any]
+    check("merge: new access token", (o?["accessToken"] as? String) ?? "nil", "new-a")
+    check("merge: refresh token kept when none returned", (o?["refreshToken"] as? String) ?? "nil", "old-r")
+    check("merge: expiresAt = now + expires_in (ms)", "\((o?["expiresAt"] as? NSNumber)?.int64Value ?? 0)", "\(Int64(1_800_028_800_000))")
+    check("merge: refreshTokenExpiresAt updated", "\((o?["refreshTokenExpiresAt"] as? NSNumber)?.int64Value ?? 0)", "\(Int64(1_800_000_100_000))")
+    check("merge: scopes from response", "\((o?["scopes"] as? [String]) ?? [])", "[\"a\", \"b\"]")
+    check("merge: untouched fields kept", "\((o?["subscriptionType"] as? String) ?? "nil")/\((o?["rateLimitTier"] as? String) ?? "nil")", "max/tier")
+    check("merge: MCP tokens kept", "\(((m?["mcpOAuth"] as? [String: Any])?["server|x"] as? [String: Any])?["accessToken"] as? String ?? "nil")", "mcp-secret")
+    let rot = mergeRefreshedTokens(into: root, response: ["access_token": "n", "expires_in": 1, "refresh_token": "rotated"],
+                                   postedRefreshToken: "old-r", now: now)
+    check("merge: rotated refresh token stored", ((rot?["claudeAiOauth"] as? [String: Any])?["refreshToken"] as? String) ?? "nil", "rotated")
+    check("merge: refuses a response without access_token", "\(mergeRefreshedTokens(into: root, response: ["expires_in": 1], postedRefreshToken: "r") == nil)", "true")
+
+    let args = securityWriteArguments(service: "svc", account: "acct", json: Data("{\"k\":1}".utf8))
+    check("write: Claude Code's exact command", args.prefix(7).joined(separator: " "), "add-generic-password -U -a acct -s svc -X")
+    check("write: payload is the JSON as hex", args.last ?? "", "7b226b223a317d")
+
+    // Locks, in a throwaway dir: Claude Code's paths, mutual exclusion, release, stale takeover.
+    let dir = NSTemporaryDirectory() + "cm-lock-\(getpid())/claude"
+    try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    let a = ClaudeRefreshLock(configDir: dir)
+    check("lock paths match Claude Code", a.paths.map { ($0 as NSString).lastPathComponent }.joined(separator: ","), ".oauth_refresh.lock,claude.lock")
+    check("lock: acquire", "\(a.acquire())", "true")
+    check("lock: second holder refused", "\(ClaudeRefreshLock(configDir: dir).acquire())", "false")
+    a.release()
+    check("lock: released dirs are gone", "\(a.paths.map { FileManager.default.fileExists(atPath: $0) })", "[false, false]")
+    _ = mkdir(a.paths[0], 0o755)    // a live holder (fresh mtime)
+    check("lock: fresh foreign lock → busy", "\(ClaudeRefreshLock(configDir: dir).acquire())", "false")
+    check("lock: busy attempt left the foreign lock alone", "\(FileManager.default.fileExists(atPath: a.paths[0]))", "true")
+    let b = ClaudeRefreshLock(configDir: dir)
+    check("lock: abandoned (>10 min) foreign lock taken over", "\(b.acquire(now: Date().addingTimeInterval(700)))", "true")
+    b.release()
+    try? FileManager.default.removeItem(atPath: (dir as NSString).deletingLastPathComponent)
+}
+
+// MARK: token refresh, round 2
+do {
+    check("account: $USER", claudeKeychainAccount(user: "davidpflugpeil"), "davidpflugpeil")
+    check("account: odd $USER → Claude Code's fallback", claudeKeychainAccount(user: "a b"), "claude-code-user")
+    check("backoff: 5 min first", "\(Int(refreshBackoff(failures: 1)))", "300")
+    check("backoff: doubles", "\(Int(refreshBackoff(failures: 3)))", "1200")
+    check("backoff: capped at 2 h", "\(Int(refreshBackoff(failures: 12)))", "7200")
+    // Claude Code's legacy lock for a profile is "<profile>.lock" in the profiles dir.
+    let lockDir = (Provider.claude.profilesDir as NSString).appendingPathComponent("Work.lock")
+    try? FileManager.default.createDirectory(atPath: lockDir, withIntermediateDirectories: true)
+    check("a profile's refresh lock is not listed as a profile",
+          "\(listProfiles(.claude).contains { $0.configDir.hasSuffix(".lock") })", "false")
+    try? FileManager.default.removeItem(atPath: lockDir)
+}
+
+check("written JSON keeps slashes like JSON.stringify",
+      String(decoding: try! JSONSerialization.data(withJSONObject: ["u": "https://x/y"], options: [.withoutEscapingSlashes]), as: UTF8.self),
+      #"{"u":"https://x/y"}"#)
+
 print(failures == 0 ? "\nALL PASS" : "\n\(failures) FAILED")
 exit(failures == 0 ? 0 : 1)

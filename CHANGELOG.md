@@ -4,6 +4,38 @@ All notable changes to Cookie Monster are documented here. The format is based o
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.8.0] — 2026-10-23
+
+### Fixed
+- **You no longer have to run `claude` every day.** 0.7.8 stopped refreshing tokens
+  because the old write-back (in-process `SecItemUpdate`) reset the keychain item's access
+  and caused the prompt storms — so an unused subscription's token expired after ~8 h and
+  stayed expired. Cookie Monster refreshes again, now exactly the way Claude Code does
+  (read out of its 2.1.306 binary):
+  - takes Claude Code's own refresh locks (`<config>/.oauth_refresh.lock`, then the legacy
+    `<config>.lock`), honouring them the way proper-lockfile does, so it never refreshes at
+    the same moment as a running `claude`;
+  - re-reads the item under the lock and uses a token someone else already refreshed;
+  - sends Claude Code's request (its `TOKEN_URL`, JSON with `scope`) and maps the response
+    the same way;
+  - writes only if the stored refresh token is still the one it sent (compare-and-swap,
+    3 attempts), changing only the `claudeAiOauth` token fields — MCP tokens untouched;
+  - stores it with Claude Code's own command, `security add-generic-password -U -a $USER
+    -s <item> -X <hex>`, so the item's access afterwards is exactly as after Claude Code's
+    own refresh (partition `apple-tool:`), and reads it back to confirm.
+  - Once the server has issued new tokens they are never dropped: every go/no-go check
+    happens before the request; a write that can't happen yet (keychain locked, say) is
+    kept in memory and stored on the next poll — or before the app quits, which waits.
+  - Refreshes 5 minutes before expiry, like Claude Code. Failures back off 5 min → 2 h
+    (honouring `Retry-After`); a rejected refresh token waits until you sign in again; this
+    bookkeeping (no secrets) survives a relaunch.
+  - Verified live: both expired sign-ins refreshed on launch, 0 dialogs, item access
+    unchanged, MCP tokens intact.
+- Claude Code's legacy lock `<profile>.lock` sits next to the profile folders and was listed
+  as a profile whenever a refresh ran. It no longer is.
+- A profile's keychain entry is now the one Claude Code derives (`Claude Code-credentials-`
+  + SHA-256 of the config dir) whenever that entry exists; discovery is only the fallback.
+
 ## [0.7.9] — 2026-10-15
 
 ### Fixed
