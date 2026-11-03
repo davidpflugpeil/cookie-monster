@@ -4,6 +4,14 @@ All notable changes to Cookie Monster are documented here. The format is based o
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.8.1] — 2026-11-03
+
+### Fixed
+- **0.8.0 wouldn't open on macOS 26 Tahoe (or anything older than 27).** `swiftc` with no
+  target builds for the Mac it runs on, so the binary required macOS 27 — whatever
+  `Info.plist` said. It also contained only Apple-silicon code. `build.sh` now builds
+  explicitly for macOS 13 and later, as one universal binary (Apple silicon + Intel).
+
 ## [0.8.0] — 2026-10-23
 
 ### Fixed

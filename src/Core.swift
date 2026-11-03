@@ -26,7 +26,7 @@ let kDiscoveryRetryInterval: TimeInterval = 600
 let kSignedOutBackoff: TimeInterval = 3600
 let kLogDir = (cmHome() as NSString).appendingPathComponent(".cookie-monster")
 let kLogFile = (kLogDir as NSString).appendingPathComponent("cookie-monster.log")
-let kVersion = "0.8.0"
+let kVersion = "0.8.1"
 
 // MARK: - Logging (no secrets ever pass through here)
 

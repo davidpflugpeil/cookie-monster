@@ -10,7 +10,17 @@ MACOS="$CONTENTS/MacOS"
 echo "› Compiling…"
 rm -rf "$APP"
 mkdir -p "$MACOS"
-swiftc -O -framework AppKit src/Core.swift src/App.swift -o "$MACOS/CookieMonster"
+# Explicit targets. Without them swiftc builds for the Mac it runs on — a binary built on
+# macOS 27 refused to open on macOS 26 Tahoe, whatever Info.plist claimed — and for its CPU
+# only. One universal binary, Intel + Apple silicon, for macOS 13 and later.
+MIN_MACOS="13.0"
+BUILD_TMP="$(mktemp -d)"
+for ARCH in arm64 x86_64; do
+    swiftc -O -target "$ARCH-apple-macos$MIN_MACOS" -framework AppKit \
+        src/Core.swift src/App.swift -o "$BUILD_TMP/CookieMonster-$ARCH"
+done
+lipo -create "$BUILD_TMP/CookieMonster-arm64" "$BUILD_TMP/CookieMonster-x86_64" -output "$MACOS/CookieMonster"
+rm -rf "$BUILD_TMP"
 
 echo "› Building app icon…"
 mkdir -p "$CONTENTS/Resources"
@@ -33,8 +43,8 @@ cat > "$CONTENTS/Info.plist" <<'PLIST'
     <key>CFBundleDisplayName</key>      <string>Cookie Monster</string>
     <key>CFBundleIdentifier</key>       <string>com.pflugpeil.cookiemonster</string>
     <key>CFBundleExecutable</key>       <string>CookieMonster</string>
-    <key>CFBundleVersion</key>          <string>0.8.0</string>
-    <key>CFBundleShortVersionString</key><string>0.8.0</string>
+    <key>CFBundleVersion</key>          <string>0.8.1</string>
+    <key>CFBundleShortVersionString</key><string>0.8.1</string>
     <key>CFBundlePackageType</key>      <string>APPL</string>
     <key>CFBundleIconFile</key>         <string>AppIcon</string>
     <key>LSMinimumSystemVersion</key>   <string>13.0</string>
