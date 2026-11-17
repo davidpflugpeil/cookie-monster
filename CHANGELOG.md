@@ -4,6 +4,20 @@ All notable changes to Cookie Monster are documented here. The format is based o
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.8.2] — 2026-11-17
+
+### Fixed
+- **A subscription could be labelled with another one's account** ("signed in as …",
+  "same account as …") while its usage was right. Before 0.8.0 a profile's keychain entry
+  was found by matching, which could pick another profile's entry and bind the profile to
+  that account; the binding then confirmed itself, because the usage request merely echoes
+  back the email it is given. Each profile's account now comes from its own token
+  (`/api/oauth/account`, once per token), "same account as" compares only such verified
+  addresses, and records that pointed at another profile's entry are dropped.
+- **"Codex — loading…" stayed on screen after Codex had loaded.** States without data were
+  drawn as plain text lines, and an open menu only updates cards in place (rebuilding it
+  re-delivers the click under the pointer). Every state is a card now, so it updates live.
+
 ## [0.8.1] — 2026-11-03
 
 ### Fixed

@@ -26,7 +26,7 @@ let kDiscoveryRetryInterval: TimeInterval = 600
 let kSignedOutBackoff: TimeInterval = 3600
 let kLogDir = (cmHome() as NSString).appendingPathComponent(".cookie-monster")
 let kLogFile = (kLogDir as NSString).appendingPathComponent("cookie-monster.log")
-let kVersion = "0.8.1"
+let kVersion = "0.8.2"
 
 // MARK: - Logging (no secrets ever pass through here)
 
@@ -1535,6 +1535,29 @@ func bindAccount(_ profileDir: String, email: String) -> Bool {
     try? email.write(toFile: accountRecordPath(profileDir), atomically: true, encoding: .utf8)
     log("profile \((profileDir as NSString).lastPathComponent) bound to \(email)")
     return true
+}
+
+/// Records the account this profile's own token resolves to. Unlike bindAccount this
+/// overwrites: the token is the truth about which account `claude` uses in that profile.
+func rebindAccount(_ profileDir: String, email: String) {
+    guard !email.isEmpty, assertInsideProfiles(profileDir),
+          boundAccount(profileDir)?.caseInsensitiveCompare(email) != .orderedSame else { return }
+    try? email.write(toFile: accountRecordPath(profileDir), atomically: true, encoding: .utf8)
+    log("profile \((profileDir as NSString).lastPathComponent) → \(email) (from its token)")
+}
+
+/// Before 0.8.0 a profile's entry was found by matching, and the match could pick another
+/// profile's entry — then bind this profile to THAT account. Where Claude Code's own entry
+/// for the profile exists, such a record and its binding are wrong: drop both.
+func dropMismatchedProfileRecords() {
+    for prof in listProfiles(.claude) where !prof.isDefault {
+        let derived = claudeKeychainService(envConfigDir: prof.configDir)
+        guard let recorded = recordedKeychainService(prof.configDir), recorded != derived,
+              keychainModDate(service: derived) != nil, assertInsideProfiles(prof.configDir) else { continue }
+        clearKeychainRecord(prof.configDir)
+        try? FileManager.default.removeItem(atPath: accountRecordPath(prof.configDir))
+        log("profile \(prof.name): record pointed at another profile's entry — dropped it and its account")
+    }
 }
 
 /// The keychain entry we last used for this profile. A CACHE, not an identity: signing in

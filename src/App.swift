@@ -106,6 +106,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var failures: [Provider: Int] = [:]             // consecutive failures → backoff
     var menuIsOpen = false                   // drives the in-place rebuild in render()
     var profileAuth: [String: AuthStatus] = [:]     // keyed by config dir
+    /// Each profile's account as its own token reports it — the only identity labels trust.
+    var profileTokenEmail: [String: (token: String, email: String)] = [:]
+    var profileEmailInFlight: Set<String> = []
     var lastActiveProfile: [Provider: String] = [:]
     var lastSwitchAt: [Provider: Date] = [:]        // debounces the switch click
     var openCards: [Provider: InfoCardView] = [:]   // live cards, updated in place
@@ -206,6 +209,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func refreshClaude() {
+        dropMismatchedProfileRecords()
         let active = activeProfile(.claude)
         let switched = active.dir != (lastActiveProfile[.claude] ?? active.dir)
         if switched {
@@ -287,19 +291,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     self.claudeEmail = nil
                     self.resolveClaudeEmail(creds)
                 }
-                // For a non-default profile prefer what the TOKEN says over `claude auth
-                // status`, which mirrors ~/.claude.json and has named the wrong account here.
-                let email = prof.isDefault ? self.claudeEmail
-                                           : (boundAccount(dir) ?? self.profileAuth[dir]?.email)
+                if !prof.isDefault { self.resolveProfileEmail(dir, creds) }
+                // The usage call doesn't report an account; whatever is passed here is echoed
+                // back, so pass only what the token itself resolved to.
+                let email = prof.isDefault ? self.claudeEmail : self.profileTokenEmail[dir]?.email
                 fetchClaudeUsage(creds: creds, email: email) { result in
                     DispatchQueue.main.async {
                         var shown = result
                         switch result {
                         case .ok(let u):
                             self.profileUsage[dir] = u
-                            if !prof.isDefault, boundAccount(dir) == nil, let e = u.email {
-                                bindAccount(dir, email: e)   // token-derived, so authoritative
-                            }
                         case .rateLimited(let until):
                             self.profileBlocked[dir] = until
                         case .tokenExpired:
@@ -385,6 +386,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+
+    /// Asks the API which account a profile's token belongs to — once per token.
+    private func resolveProfileEmail(_ dir: String, _ creds: Credentials) {
+        guard profileTokenEmail[dir]?.token != creds.accessToken,
+              !profileEmailInFlight.contains(dir) else { return }
+        profileEmailInFlight.insert(dir)
+        let token = creds.accessToken
+        fetchAccountEmail(creds: creds) { email in
+            DispatchQueue.main.async {
+                self.profileEmailInFlight.remove(dir)
+                guard let email = email else { return }
+                self.profileTokenEmail[dir] = (token, email)
+                rebindAccount(dir, email: email)
+                self.render()
+            }
+        }
+    }
 
     private func resolveClaudeEmail(_ creds: Credentials) {
         claudeEmailInFlight = true
@@ -714,55 +732,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(item("Quit Cookie Monster", #selector(quit), "q"))
     }
 
+    /// Every state is drawn as a card. An open menu is only ever updated in place (a rebuild
+    /// re-delivers the click under the pointer), and only cards can be — a plain text line
+    /// like "loading…" stayed on screen after the data arrived.
     private func addSection(_ menu: NSMenu, for p: Provider) {
-        switch states[p] ?? .loading {
-        case .notConfigured:
-            break
-        case .loading:
-            disabled(menu, "\(p.label) — loading…", bold: true)
-        case .needsAuth:
-            disabled(menu, "\(p.label) — not signed in", bold: true)
-            disabled(menu, p.signInHint, bold: false)
-        case .rateLimited(let until):
-            // The numbers can't have moved while we're locked out, so the last good card
-            // is still the best answer — just say when we'll try again.
-            if let u = lastGood[p] {
-                addCard(menu, p, u) { [weak self] in
-                    guard let t = self?.nextAllowed[p] ?? until as Date? else { return nil }
-                    return "rate limited · \(countdown(to: t))"
-                }
-            } else {
-                disabled(menu, "\(p.label) — rate limited", bold: true)
-                disabled(menu, "retrying in \(countdown(to: until))", bold: false)
-            }
-        case .otherProfile where listProfiles(p).count > 1:
-            addSwitcherCard(menu, p, note: otherProfileNote(p))
-        case .otherProfile:
-            // Looked up here, not captured in the state: the probe answers asynchronously.
-            let dir = activeProfileDir(p)
-            let auth = profileAuth[dir]
-            let name = listProfiles(p).first { $0.configDir == dir }?.name ?? "profile"
-            disabled(menu, "Claude — \(auth?.email ?? name)", bold: true)
-            disabled(menu, otherProfileNote(p), bold: false)
-        case .tokenExpired where listProfiles(p).count > 1:
-            addSwitcherCard(menu, p, note: "token expired — run `\(p.cliName)` once to refresh it")
-        case .tokenExpired:
-            disabled(menu, "\(p.label) — token expired", bold: true)
-            disabled(menu, "Run `\(p.cliName)` once; it refreshes the token automatically.", bold: false)
-        case .needsAuth where listProfiles(p).count > 1:
-            addSwitcherCard(menu, p, note: "not signed in — use Copy Sign-in Command")
-        case .error(let msg) where listProfiles(p).count > 1 && lastGood[p] == nil:
-            addSwitcherCard(menu, p, note: msg)
-        case .error(let msg):
-            if let u = lastGood[p] {
-                addCard(menu, p, u) { "couldn't refresh" }
-            } else {
-                disabled(menu, "\(p.label) — couldn't reach usage API", bold: true)
-                disabled(menu, msg, bold: false)
-            }
-        case .ok(let u):
-            addCard(menu, p, u)
-        }
+        if case .notConfigured? = states[p] { return }
+        let c = cardContent(p)
+        let card = InfoCardView(title: c.title, email: c.email, rows: c.rows, fetchedAt: c.fetchedAt,
+                                note: c.note, accounts: switcherAccounts(p),
+                                onSwitch: { [weak self] dir in self?.switchProfile(p, to: dir) },
+                                pinnedID: c.pinnedID) { [weak self] id in self?.pick(id) }
+        let entry = NSMenuItem()
+        entry.isEnabled = true
+        entry.view = card
+        liveRefreshers.append { [weak card] in card?.refresh() }
+        openCards[p] = card
+        menu.addItem(entry)
     }
 
     /// The subscriptions the switcher offers, each showing the pinned metric for that account.
@@ -779,47 +764,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let pct = pinnedMetric?.pct
             // The longest window that isn't the pinned one — the two rarely coincide.
             let secondary = metrics.last { $0.id != pinnedMetric?.id }?.pct
-            let bound = prof.isDefault ? nil : boundAccount(prof.configDir)
-            // The default profile's address from the token beats ~/.claude.json's.
-            let tokenEmail = prof.isDefault
-                ? ((provider == .claude ? claudeEmail : nil) ?? usage?.email) : nil
-            let signedInAs = tokenEmail ?? profileAuth[prof.configDir]?.email
-            let account = bound ?? signedInAs ?? usage?.email
-                ?? (prof.isDefault && provider == .claude ? claudeEmail : nil)
-            // Lead with the label the user assigned; the account follows it.
+            // Only what a token reported counts as identity: the default profile's resolved
+            // email, a profile's own token, or (Codex) the usage payload. ~/.claude.json and
+            // old bindings are just a fallback for the label, never for "same account as".
+            let verified: String? = provider == .codex ? usage?.email
+                : (prof.isDefault ? claudeEmail : profileTokenEmail[prof.configDir]?.email)
+            let account = verified
+                ?? (prof.isDefault ? nil : boundAccount(prof.configDir))
+                ?? profileAuth[prof.configDir]?.email
             var label = account.map { "\(prof.name) — \($0)" } ?? prof.name
-            if let bound = bound, let now = signedInAs,
-               bound.caseInsensitiveCompare(now) != .orderedSame {
-                label = "\(prof.name) — signed in as \(now)"   // never silently relabel
-            }
-            let identity = prof.isDefault ? tokenEmail : (bound ?? usage?.email)
-            if let account = identity, !prof.isDefault,
-               let dup = seen[account.lowercased()] {
+            if let id = verified, let dup = seen[id.lowercased()] {
                 // Two profiles on one account look like two subscriptions but aren't — say so
                 // rather than letting the user believe they are switching between plans.
                 label = "\(prof.name) — same account as \(dup)"
             }
-            if let account = identity { seen[account.lowercased()] = prof.name }
+            if let id = verified { seen[id.lowercased()] = prof.name }
             return InfoCardView.Account(dir: prof.configDir, label: label, pct: pct,
                                         secondary: secondary,
                                         active: prof.configDir == active)
         }
-    }
-
-    /// A card with the switcher but no usage rows, so a profile that can't be read yet still
-    /// lets you pick a different one without hunting through the submenu.
-    private func addSwitcherCard(_ menu: NSMenu, _ p: Provider, note: String) {
-        let card = InfoCardView(title: p.label, email: nil, rows: [], fetchedAt: Date(),
-                                note: { note },
-                                accounts: switcherAccounts(p),
-                                onSwitch: { [weak self] dir in self?.switchProfile(p, to: dir) },
-                                pinnedID: nil, onPick: { _ in })
-        let entry = NSMenuItem()
-        entry.isEnabled = true
-        entry.view = card
-        liveRefreshers.append { [weak card] in card?.refresh() }
-        openCards[p] = card
-        menu.addItem(entry)
     }
 
     /// What an open card should show right now, mirroring addSection's card cases, so a
@@ -854,7 +817,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case .tokenExpired:
             return bare("token expired — run `\(p.cliName)` once to refresh it")
         case .needsAuth:
-            return bare("not signed in — use Copy Sign-in Command")
+            return bare(listProfiles(p).count > 1 ? "not signed in — use Copy Sign-in Command" : p.signInHint)
         case .loading:
             return bare("loading…")
         case .notConfigured:
@@ -875,31 +838,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let auth = profileAuth[dir] else { return "identifying this profile…" }
         return auth.loggedIn ? "reading this profile's usage…"
                              : "not signed in — use Copy Sign-in Command"
-    }
-
-    private func addCard(_ menu: NSMenu, _ p: Provider, _ u: ProviderUsage,
-                         note: @escaping () -> String? = { nil }) {
-        let rows = u.metrics.map {
-            InfoCardView.Row(id: $0.id, name: $0.name, pct: $0.pct, resets: $0.resets)
-        }
-        // claudeEmail arrives on its own request, so prefer the freshest value.
-        let email = (p == .claude ? claudeEmail : nil) ?? u.email
-        let card = InfoCardView(title: "\(u.provider.label) \(u.plan)",
-                                email: email,
-                                rows: rows,
-                                fetchedAt: u.fetchedAt,
-                                note: note,
-                                accounts: switcherAccounts(p),
-                                onSwitch: { [weak self] dir in self?.switchProfile(p, to: dir) },
-                                pinnedID: pinnedMetric?.id) { [weak self] id in
-            self?.pick(id)
-        }
-        let cardItem = NSMenuItem()
-        cardItem.isEnabled = true
-        cardItem.view = card
-        liveRefreshers.append { [weak card] in card?.refresh() }
-        openCards[p] = card
-        menu.addItem(cardItem)
     }
 
     private func disabled(_ menu: NSMenu, _ s: String, bold: Bool) {
@@ -923,7 +861,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for prof in listProfiles(provider) {
             let auth = profileAuth[prof.configDir]
             var title = prof.name
-            if let email = auth?.email, !email.isEmpty {
+            let verified: String? = provider == .codex ? profileUsage[prof.configDir]?.email
+                : (prof.isDefault ? claudeEmail : profileTokenEmail[prof.configDir]?.email)
+            if let email = verified ?? auth?.email, !email.isEmpty {
                 title += " — \(email)"
             } else if let auth = auth {
                 // `claude auth status` reports email only when ~/.claude.json still carries
