@@ -535,6 +535,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard case .ok(let u)? = states[p], let first = u.metrics.first else { return }
         let id = Prefs.pinnedID
         guard id.hasPrefix("\(p.rawValue)."), !u.metrics.contains(where: { $0.id == id }) else { return }
+        // Absent for now isn't outdated: an idle account has no session window, and moving
+        // the pin to Week then would keep it there after the next message.
+        if kClaudeMetricIDs.contains(id) { return }
         Prefs.pinnedID = first.id
         log("pin \(id) no longer exists → \(first.id)")
     }
@@ -582,6 +585,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Ids can change between versions — stay on the pinned provider before falling
         // back across subscriptions.
         if let p = Provider(rawValue: id.split(separator: ".").first.map(String.init) ?? "") {
+            // The pinned window exists but this account has none right now (no message in
+            // the last five hours → no session window). The menu bar has no label, so the
+            // weekly figure would pass for the 5h one. Only while Claude is set up: on a
+            // Codex-only Mac the default pin is still a Claude id.
+            if kClaudeMetricIDs.contains(id), let st = states[p], !isNotConfigured(st) { return nil }
             if let m = live.first(where: { $0.provider == p }) { return m }
             if let m = cached.first(where: { $0.provider == p }) { return m }
             // Present but unreadable (switched profile, signed out, errored). The menu bar
@@ -606,7 +614,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // and AppKit then delivers the pending click to the replacement. Update what the
         // cards show instead; the full rebuild happens on the next open.
         for p in Provider.allCases {
-            openCards[p]?.update(cardContent(p), accounts: switcherAccounts(p))
+            openCards[p]?.update(cardContent(p), switcher: switcher(p))
         }
         liveRefreshers.forEach { $0() }
     }
@@ -739,31 +747,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if case .notConfigured? = states[p] { return }
         let c = cardContent(p)
         let card = InfoCardView(title: c.title, email: c.email, rows: c.rows, fetchedAt: c.fetchedAt,
-                                note: c.note, accounts: switcherAccounts(p),
+                                note: c.note, switcher: switcher(p),
                                 onSwitch: { [weak self] dir in self?.switchProfile(p, to: dir) },
                                 pinnedID: c.pinnedID) { [weak self] id in self?.pick(id) }
         let entry = NSMenuItem()
         entry.isEnabled = true
+        // The menu is as wide as its widest card; stretch the rest so right edges line up.
+        card.autoresizingMask = [.width]
         entry.view = card
         liveRefreshers.append { [weak card] in card?.refresh() }
         openCards[p] = card
         menu.addItem(entry)
     }
 
-    /// The subscriptions the switcher offers, each showing the pinned metric for that account.
-    private func switcherAccounts(_ provider: Provider) -> [InfoCardView.Account] {
+    /// The subscriptions the switcher offers, with the same windows in the same columns on
+    /// every row (see switcherColumns).
+    private func switcher(_ provider: Provider) -> InfoCardView.Switcher {
         let profiles = listProfiles(provider)
-        guard profiles.count > 1 else { return [] }
+        guard profiles.count > 1 else { return InfoCardView.Switcher() }
         let active = activeProfileDir(provider)
-        let pinned = Prefs.pinnedID
+        let columns = switcherColumns(profiles.map { profileUsage[$0.configDir]?.metrics ?? [] },
+                                      pinned: Prefs.pinnedID)
         var seen: [String: String] = [:]      // account -> first profile holding it
-        return profiles.map { prof in
+        let accounts = profiles.map { prof -> InfoCardView.Account in
             let usage = profileUsage[prof.configDir]
             let metrics = usage?.metrics ?? []
-            let pinnedMetric = metrics.first { $0.id == pinned } ?? metrics.first
-            let pct = pinnedMetric?.pct
-            // The longest window that isn't the pinned one — the two rarely coincide.
-            let secondary = metrics.last { $0.id != pinnedMetric?.id }?.pct
+            let values = columns.map { c in metrics.first { $0.id == c.id }?.pct }
+            let hasReading = !metrics.isEmpty
             // Only what a token reported counts as identity: the default profile's resolved
             // email, a profile's own token, or (Codex) the usage payload. ~/.claude.json and
             // old bindings are just a fallback for the label, never for "same account as".
@@ -779,10 +789,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 label = "\(prof.name) — same account as \(dup)"
             }
             if let id = verified { seen[id.lowercased()] = prof.name }
-            return InfoCardView.Account(dir: prof.configDir, label: label, pct: pct,
-                                        secondary: secondary,
-                                        active: prof.configDir == active)
+            return InfoCardView.Account(dir: prof.configDir, label: label, values: values,
+                                        hasReading: hasReading, active: prof.configDir == active)
         }
+        return InfoCardView.Switcher(columns: columns.map { .init(id: $0.id, name: $0.name) },
+                                     accounts: accounts)
     }
 
     /// What an open card should show right now, mirroring addSection's card cases, so a
@@ -1001,7 +1012,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // In place, never a rebuild: the menu stays exactly as it is, so no view is replaced
         // under the cursor and no click can be re-delivered.
         for p in Provider.allCases {
-            openCards[p]?.update(cardContent(p), accounts: switcherAccounts(p))
+            openCards[p]?.update(cardContent(p), switcher: switcher(p))
         }
     }
 
@@ -1168,12 +1179,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
 final class InfoCardView: NSView {
     struct Row { let id: String; let name: String; let pct: Double; let resets: Date? }
-    /// One switchable subscription, with the pinned metric's value for that account.
+    /// One switchable subscription, with its value for each of the switcher's columns.
     struct Account {
         let dir: String; let label: String
-        let pct: Double?        // the pinned metric
-        let secondary: Double?  // the next window, so two accounts can't look identical
+        let values: [Double?]   // same order as Switcher.columns; nil = no such window
+        let hasReading: Bool    // false: not fetched (yet) — cells read "—", not blank
         let active: Bool
+    }
+    struct Column { let id: String; let name: String }
+    /// The subscription switcher: labelled columns, one window each, identical on every row.
+    struct Switcher {
+        var columns: [Column] = []
+        var accounts: [Account] = []
     }
 
     /// Everything the card shows apart from the switcher; swapped in place on a switch.
@@ -1188,6 +1205,7 @@ final class InfoCardView: NSView {
 
     private var title: String
     private var email: String?
+    private var columns: [Column]
     private var accounts: [Account]
     private let onSwitch: (String) -> Void
     private var note: () -> String?
@@ -1200,34 +1218,32 @@ final class InfoCardView: NSView {
     private var accountRects: [(rect: NSRect, dir: String)] = []
 
     init(title: String, email: String?, rows: [Row], fetchedAt: Date, note: @escaping () -> String? = { nil },
-         accounts: [Account] = [], onSwitch: @escaping (String) -> Void = { _ in },
+         switcher: Switcher = Switcher(), onSwitch: @escaping (String) -> Void = { _ in },
          pinnedID: String?, onPick: @escaping (String) -> Void) {
         self.title = title; self.email = email; self.rows = rows; self.note = note
-        self.accounts = accounts; self.onSwitch = onSwitch
+        self.columns = switcher.columns; self.accounts = switcher.accounts; self.onSwitch = onSwitch
         self.fetchedAt = fetchedAt; self.pinnedID = pinnedID; self.onPick = onPick
-        super.init(frame: NSRect(x: 0, y: 0, width: 300, height: 10))
-        setFrameSize(NSSize(width: 300, height: layout(false)))   // exact fit to content
+        super.init(frame: NSRect(x: 0, y: 0, width: Self.minWidth, height: 10))
+        setFrameSize(NSSize(width: preferredWidth(), height: 10))
+        setFrameSize(NSSize(width: frame.width, height: layout(false)))   // exact fit to content
     }
     required init?(coder: NSCoder) { fatalError() }
     override var isFlipped: Bool { true }        // lay out top→down
     func refresh() { needsDisplay = true }
 
-    /// Swap in new switcher data without rebuilding the menu. Rebuilding replaces this view
-    /// while the menu is tracking, and the replacement receives the in-flight click — which
-    /// is what made a selection flip back a second or two later.
-    func updateAccounts(_ next: [Account]) {
-        accounts = next
-        needsDisplay = true
-    }
-
-    /// Swap in another profile's bars, title and note — same reason as updateAccounts. The
-    /// height follows the content so a profile with more (or no) rows isn't clipped.
-    func update(_ c: Content, accounts next: [Account]) {
+    /// Swap in another profile's bars, title, note and switcher without rebuilding the menu.
+    /// Rebuilding replaces this view while the menu is tracking, and the replacement receives
+    /// the in-flight click — which is what made a selection flip back a second or two later.
+    /// The height follows the content so a profile with more (or no) rows isn't clipped.
+    func update(_ c: Content, switcher next: Switcher) {
         title = c.title; email = c.email; rows = c.rows; fetchedAt = c.fetchedAt
-        note = c.note; pinnedID = c.pinnedID; accounts = next
-        let h = layout(false)
-        if abs(h - frame.height) > 0.5 {
-            setFrameSize(NSSize(width: frame.width, height: h))
+        note = c.note; pinnedID = c.pinnedID; columns = next.columns; accounts = next.accounts
+        // Grow for a longer name; never shrink while open — the menu may have widened this
+        // card to match another one.
+        let wNew = max(frame.width, preferredWidth())
+        let h = layout(false)                    // height doesn't depend on width
+        if abs(h - frame.height) > 0.5 || abs(wNew - frame.width) > 0.5 {
+            setFrameSize(NSSize(width: wNew, height: h))
             if let item = enclosingMenuItem { item.menu?.itemChanged(item) }
         }
         needsDisplay = true
@@ -1264,6 +1280,45 @@ final class InfoCardView: NSView {
         s.draw(at: NSPoint(x: x + 6, y: y + 3))
     }
 
+    static let minWidth: CGFloat = 300
+    private static let valueFont = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .bold)
+    private static let headerFont = NSFont.systemFont(ofSize: 11, weight: .medium)
+    private static let colGap: CGFloat = 12
+    private static func labelFont(_ active: Bool) -> NSFont {
+        .systemFont(ofSize: 12, weight: active ? .semibold : .regular)
+    }
+
+    /// The switcher's columns and their widths (wide enough for "100%" and for the name).
+    private func columnGeometry() -> (cols: [Column], widths: [CGFloat], total: CGFloat) {
+        let cols = columns.isEmpty ? [Column(id: "", name: "")] : columns
+        let widths = cols.map { c in
+            ceil(max(t("100%", Self.valueFont, .labelColor).size().width,
+                     t(c.name, Self.headerFont, .labelColor).size().width))
+        }
+        return (cols, widths, widths.reduce(0, +) + Self.colGap * CGFloat(max(0, cols.count - 1)))
+    }
+
+    /// Wide enough that no account name, title or address is cut off. The menu is as wide
+    /// as its widest card, and the other cards stretch to it (autoresizingMask .width).
+    private func preferredWidth() -> CGFloat {
+        let x: CGFloat = 16
+        var need = Self.minWidth
+        if accounts.count > 1 {
+            let cols = columnGeometry().total
+            for a in accounts {
+                let lw = NSAttributedString(string: a.label, attributes: [.font: Self.labelFont(a.active)]).size().width
+                need = max(need, x + 14 + ceil(lw) + 2 + 10 + cols + x)
+            }
+            let tw = t(title, .systemFont(ofSize: 13, weight: .bold), .labelColor).size().width
+            need = max(need, x + ceil(tw) + 16 + cols + x)
+        } else if let email = email {
+            need = max(need, x + ceil(t(email, .systemFont(ofSize: 12, weight: .regular), .labelColor).size().width) + x)
+        }
+        // A cap so a pathological name can't make the menu span the screen; past it the
+        // label is shortened in the middle.
+        return min(ceil(need), 640)
+    }
+
     /// Single source of truth for layout: with `paint` false it only advances `y`
     /// (so the frame fits exactly); with `paint` true it draws.
     @discardableResult
@@ -1273,10 +1328,25 @@ final class InfoCardView: NSView {
         var y: CGFloat = 13
         accountRects.removeAll()
         if paint { left(t(title, .systemFont(ofSize: 13, weight: .bold), .secondaryLabelColor), x, y) }
+        // Switcher columns: one window each, named on the title line, right edges fixed, so a
+        // number always sits under the name of the window it belongs to. The pinned window's
+        // name is tinted like the PINNED pill below.
+        let (cols, colWidths, _) = columnGeometry()
+        let headerFont = Self.headerFont, colGap = Self.colGap
+        var colRights: [CGFloat] = []
+        var edge = w - x
+        for cwid in colWidths.reversed() { colRights.insert(edge, at: 0); edge -= cwid + colGap }
+        let valuesLeft = edge + colGap   // where the leftmost column starts
+        if paint, accounts.count > 1 {
+            for (i, c) in cols.enumerated() where !c.name.isEmpty {
+                let pinned = c.id == pinnedID
+                right(t(c.name, headerFont, pinned ? .controlAccentColor : .tertiaryLabelColor), colRights[i], y + 2)
+            }
+        }
         y += accounts.count > 1 ? 23 : 18   // the switcher's tint needs air under the title
         if accounts.count > 1 {
-            // A switcher, not a label: each row is the account plus its pinned metric, and
-            // clicking one makes it the subscription `claude` uses.
+            // A switcher, not a label: each row is the account plus its value for each column,
+            // and clicking one makes it the subscription `claude` uses.
             for a in accounts {
                 let block = NSRect(x: x - 8, y: y - 4, width: cw + 16, height: 22)
                 accountRects.append((block, a.dir))
@@ -1288,31 +1358,26 @@ final class InfoCardView: NSView {
                     let dot = NSRect(x: x, y: y + 4, width: 6, height: 6)
                     (a.active ? NSColor.controlAccentColor : NSColor.quaternaryLabelColor).setFill()
                     NSBezierPath(ovalIn: dot).fill()
-                    // Two subscriptions often sit at a similar value on one window, so show
-                    // the next one too — otherwise identical numbers read as a bug.
-                    var valueWidth: CGFloat = 0
-                    if let second = a.secondary {
-                        let secondText = t(String(format: "%.0f%%", second),
-                                           .monospacedDigitSystemFont(ofSize: 11, weight: .regular),
-                                           .tertiaryLabelColor)
-                        right(secondText, w - x, y + 1)
-                        valueWidth = secondText.size().width + 7
+                    for (i, c) in cols.enumerated() {
+                        let v = i < a.values.count ? a.values[i] : nil
+                        // A window this account doesn't have stays empty; "—" means no reading.
+                        if v == nil, a.hasReading { continue }
+                        let bold = a.active && c.id == pinnedID
+                        right(t(v.map { String(format: "%.0f%%", $0) } ?? "—",
+                                .monospacedDigitSystemFont(ofSize: 12, weight: bold ? .bold : .regular),
+                                v == nil ? .tertiaryLabelColor
+                                         : (a.active ? .labelColor : .secondaryLabelColor)),
+                              colRights[i], y)
                     }
-                    let value = a.pct.map { String(format: "%.0f%%", $0) } ?? "—"
-                    let valueText = t(value,
-                                      .monospacedDigitSystemFont(ofSize: 12, weight: a.active ? .bold : .regular),
-                                      a.pct == nil ? .tertiaryLabelColor
-                                                   : (a.active ? .labelColor : .secondaryLabelColor))
-                    right(valueText, w - x - valueWidth, y)
-                    valueWidth += valueText.size().width
-                    // Clip the label to the space left over, so renaming to something long
-                    // can never overlap the number.
+                    // The card is sized so the whole name fits (preferredWidth). Only a name
+                    // past the width cap is shortened — in the middle, so the end of the
+                    // address (.com vs .de) still tells two subscriptions apart.
                     let labelX = x + 14
-                    let avail = (w - x) - valueWidth - 10 - labelX
+                    let avail = valuesLeft - 10 - labelX
                     let para = NSMutableParagraphStyle()
-                    para.lineBreakMode = .byTruncatingTail
+                    para.lineBreakMode = .byTruncatingMiddle
                     NSAttributedString(string: a.label, attributes: [
-                        .font: NSFont.systemFont(ofSize: 12, weight: a.active ? .semibold : .regular),
+                        .font: Self.labelFont(a.active),
                         .foregroundColor: a.active ? NSColor.labelColor : NSColor.secondaryLabelColor,
                         .paragraphStyle: para,
                     ]).draw(in: NSRect(x: labelX, y: y, width: max(40, avail), height: 16))
@@ -1358,7 +1423,10 @@ final class InfoCardView: NSView {
             y += barH + gap
             if paint {
                 if isPinned { pill(x, y) }
-                right(t("resets in \(countdown(to: r.resets))", .systemFont(ofSize: 12, weight: .medium), .secondaryLabelColor), w - x, y)
+                // A window with nothing used and no reset time hasn't started yet (Claude
+                // sends no session window at all until the next message).
+                let when = r.resets == nil && r.pct == 0 ? "not started" : "resets in \(countdown(to: r.resets))"
+                right(t(when, .systemFont(ofSize: 12, weight: .medium), .secondaryLabelColor), w - x, y)
             }
             y += resetH
             if i < rows.count - 1 { y += 16 }

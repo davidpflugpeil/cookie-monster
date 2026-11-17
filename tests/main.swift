@@ -310,5 +310,45 @@ check("written JSON keeps slashes like JSON.stringify",
       String(decoding: try! JSONSerialization.data(withJSONObject: ["u": "https://x/y"], options: [.withoutEscapingSlashes]), as: UTF8.self),
       #"{"u":"https://x/y"}"#)
 
+// Usage windows: an idle account's missing session window, and fixed switcher columns.
+do {
+    func ids(_ ms: [Metric]) -> String { ms.map { "\($0.id)=\(Int($0.pct))" }.joined(separator: ",") }
+    let w = { (u: Double) -> [String: Any] in ["utilization": u, "resets_at": "2026-11-20T10:00:00Z"] }
+    check("usage: both windows", ids(claudeMetrics(["five_hour": w(50), "seven_day": w(8)])),
+          "claude.session=50,claude.week=8")
+    check("usage: no 5h window (null) → no Session",
+          ids(claudeMetrics(["five_hour": NSNull(), "seven_day": w(5)])), "claude.week=5")
+    check("usage: no 5h window (missing) → no Session",
+          ids(claudeMetrics(["seven_day": w(100)])), "claude.week=100")
+    check("usage: unreadable session window is left out",
+          ids(claudeMetrics(["five_hour": ["weird": 1], "seven_day": w(5)])), "claude.week=5")
+    check("usage: every id claudeMetrics makes is a known Claude id",
+          "\(claudeMetrics(["five_hour": w(1), "seven_day": w(2), "seven_day_opus": w(3)]).allSatisfy { kClaudeMetricIDs.contains($0.id) })", "true")
+    check("usage: nothing at all stays empty", ids(claudeMetrics([:])), "")
+    check("usage: per-model week after the week",
+          ids(claudeMetrics(["five_hour": w(1), "seven_day": w(2), "seven_day_sonnet": w(3)])),
+          "claude.session=1,claude.week=2,claude.weekModel=3")
+
+    func cols(_ lists: [[Metric]], _ pin: String) -> String {
+        switcherColumns(lists, pinned: pin).map { "\($0.id):\($0.name)" }.joined(separator: ",")
+    }
+    let both = claudeMetrics(["five_hour": w(50), "seven_day": w(8), "seven_day_opus": w(3)])
+    let weekOnly = claudeMetrics(["five_hour": NSNull(), "seven_day": w(5)])   // an idle account
+    check("switcher: session then week, whatever row comes first",
+          cols([weekOnly, both], "claude.week"), "claude.session:Session,claude.week:Week")
+    check("switcher: same columns when pinned to session",
+          cols([both, weekOnly], "claude.session"), "claude.session:Session,claude.week:Week")
+    check("switcher: a pinned per-model week gets a column",
+          cols([both], "claude.weekModel"), "claude.session:Session,claude.weekModel:Week Opus")
+    check("switcher: another provider's pin changes nothing",
+          cols([both], "codex.5h"), "claude.session:Session,claude.week:Week")
+    check("switcher: no readings, no columns", cols([[], []], "claude.week"), "")
+    check("switcher: nobody has a 5h window → no Session column",
+          cols([weekOnly, weekOnly], "claude.week"), "claude.week:Week")
+    let sonnet = claudeMetrics(["five_hour": w(1), "seven_day": w(2), "seven_day_sonnet": w(3)])
+    check("switcher: Opus on one account, Sonnet on another → neutral header",
+          cols([both, sonnet], "claude.weekModel"), "claude.session:Session,claude.weekModel:Week model")
+}
+
 print(failures == 0 ? "\nALL PASS" : "\n\(failures) FAILED")
 exit(failures == 0 ? 0 : 1)

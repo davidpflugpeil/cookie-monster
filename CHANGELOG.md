@@ -4,6 +4,24 @@ All notable changes to Cookie Monster are documented here. The format is based o
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.8.3] — 2026-11-17
+
+### Fixed
+- **The subscription switcher mixed up the session and weekly numbers.** Each row showed
+  "the pinned window, then the last other one" without labels, and an account with no
+  message in the last five hours has no 5h window (`five_hour: null`), so it showed only
+  its weekly figure — in the column where the active account showed its session. 50% of a
+  session read as 50% of the week. The switcher now has labelled columns (Session, Week)
+  that mean the same window on every row, with the pinned one tinted like its PINNED pill.
+  An account without a window leaves that cell empty.
+- **A pin on Session moved itself to Week** the first time the active account had no 5h
+  window, and stayed there. A missing window no longer rewrites the pin; the menu bar
+  shows "—" until the window is back, instead of passing the weekly figure off as the 5h one.
+
+### Changed
+- Account names are no longer cut off: the card grows to fit the longest one, and the
+  other cards stretch to the same width.
+
 ## [0.8.2] — 2026-11-17
 
 ### Fixed

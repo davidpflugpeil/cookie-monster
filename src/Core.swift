@@ -26,7 +26,7 @@ let kDiscoveryRetryInterval: TimeInterval = 600
 let kSignedOutBackoff: TimeInterval = 3600
 let kLogDir = (cmHome() as NSString).appendingPathComponent(".cookie-monster")
 let kLogFile = (kLogDir as NSString).appendingPathComponent("cookie-monster.log")
-let kVersion = "0.8.2"
+let kVersion = "0.8.3"
 
 // MARK: - Logging (no secrets ever pass through here)
 
@@ -1663,6 +1663,56 @@ func parseWindow(_ obj: Any?) -> (pct: Double, resets: Date?)? {
     return (util, parseDate(d["resets_at"] as? String))
 }
 
+/// Every window id claudeMetrics can produce. A window can be missing from one reading and
+/// back in the next (`five_hour` is null on an account with no message in the last five
+/// hours), so a pin on one of these is never "outdated" — only absent for now.
+let kClaudeMetricIDs: Set<String> = ["claude.session", "claude.week", "claude.weekModel"]
+
+/// The windows of a Claude usage response, in a fixed order: session, week, then the
+/// per-model week if there is one. Only windows the response actually has: an account
+/// with `five_hour: null` has no session window, and none is shown for it.
+func claudeMetrics(_ root: [String: Any]) -> [Metric] {
+    var metrics: [Metric] = []
+    func add(_ id: String, _ name: String, _ w: (pct: Double, resets: Date?)?) {
+        guard let w = w else { return }
+        metrics.append(Metric(id: id, provider: .claude, name: name, pct: w.pct, resets: w.resets))
+    }
+    add("claude.session", "Session", parseWindow(root["five_hour"]))
+    add("claude.week", "Week", parseWindow(root["seven_day"]))
+    if let m = parseWindow(root["seven_day_opus"]) {
+        add("claude.weekModel", "Week Opus", m)
+    } else if let m = parseWindow(root["seven_day_sonnet"]) {
+        add("claude.weekModel", "Week Sonnet", m)
+    }
+    return metrics
+}
+
+/// The windows the subscription switcher shows side by side, one column each, the same
+/// for every row. Each row used to show "the pinned window, then the last other one", so a
+/// row missing a window shifted its numbers into the neighbouring column and 50% of a
+/// session read as 50% of the week. Order follows the fullest response (session before
+/// week); the pinned window always gets a column. A row without a window leaves its cell
+/// empty.
+func switcherColumns(_ lists: [[Metric]], pinned: String, limit: Int = 2) -> [(id: String, name: String)] {
+    guard limit > 0, let base = lists.max(by: { $0.count < $1.count }) else { return [] }
+    var ids: [String] = [], names: [String: String] = [:], conflicting: Set<String> = []
+    for m in base + lists.flatMap({ $0 }) {
+        if let known = names[m.id] {
+            if known != m.name { conflicting.insert(m.id) }
+        } else {
+            ids.append(m.id); names[m.id] = m.name
+        }
+    }
+    // One id, different windows: claude.weekModel is "Week Opus" on one account and "Week
+    // Sonnet" on another. A header naming either would mislabel the other row's number.
+    let neutral = ["claude.weekModel": "Week model"]
+    var cols = Array(ids.prefix(limit))
+    if ids.contains(pinned), !cols.contains(pinned) { cols[cols.count - 1] = pinned }
+    return cols.map { id in
+        (id, conflicting.contains(id) ? (neutral[id] ?? id) : (names[id] ?? id))
+    }
+}
+
 /// Codex reports windows as `{used_percent, limit_window_seconds, reset_at, reset_after_seconds}`.
 func parseCodexWindow(_ obj: Any?) -> (pct: Double, span: Double, resets: Date?)? {
     guard let d = obj as? [String: Any],
@@ -1774,20 +1824,7 @@ func fetchClaudeUsage(creds: Credentials, email: String?, completion: @escaping 
             completion(.error("HTTP \(http.statusCode)")); return
         }
 
-        var metrics: [Metric] = []
-        func add(_ id: String, _ name: String, _ w: (pct: Double, resets: Date?)?) {
-            guard let w = w else { return }
-            metrics.append(Metric(id: id, provider: .claude, name: name,
-                                  pct: w.pct, resets: w.resets))
-        }
-        add("claude.session", "Session", parseWindow(root["five_hour"]))
-        add("claude.week", "Week", parseWindow(root["seven_day"]))
-        if let m = parseWindow(root["seven_day_opus"]) {
-            add("claude.weekModel", "Week Opus", m)
-        } else if let m = parseWindow(root["seven_day_sonnet"]) {
-            add("claude.weekModel", "Week Sonnet", m)
-        }
-
+        let metrics = claudeMetrics(root)
         log("claude ok " + metrics.map { "\($0.name)=\(Int($0.pct))%" }.joined(separator: " "))
         completion(.ok(ProviderUsage(provider: .claude,
                                      plan: planDisplayName(creds.plan),
